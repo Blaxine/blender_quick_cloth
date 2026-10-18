@@ -99,11 +99,16 @@ def preflight(context, obj, storage=False):
             warnings.append(f'{p.body.name}: intended body has no enabled collision')
         elif any(m.type == 'ARMATURE' for m in list(p.body.modifiers)[list(p.body.modifiers).index(collider)+1:]):
             errors.append(f'{p.body.name}: move Collision after Armature deformation')
+    # Validate all owned fields before a rebuild can discard the old cache.
+    from . import owned_helper
+    for helper, kind in ((p.wind, 'WIND'), (p.turbulence, 'TURBULENCE')):
+        if owned_helper(helper, p) and (helper.field is None or helper.field.type != kind):
+            errors.append(f'{helper.name}: owned force field was changed; remove and recreate it')
+    if owned_helper(p.wind, p) and (p.wind.parent or p.wind.constraints):
+        errors.append('Owned wind has a parent/constraint; remove it before using world-space direction')
     if p.use_wind:
         if sum(v*v for v in p.wind_direction) < 1e-12:
             errors.append('Wind direction cannot be zero')
-        if p.wind and (p.wind.parent or p.wind.constraints):
-            errors.append('Owned wind has a parent/constraint; remove it before using world-space direction')
     if p.use_pressure and storage:
         import bmesh
         bm = bmesh.new()
@@ -178,13 +183,43 @@ def rna_values(data, excluded=()):
     return values
 
 
+def static_transform_channels(item, animation, prefix=''):
+    """Hash authored channels not driven by actions, NLA, or drivers.
+
+    Evaluated matrices change with timeline position; omitting the whole matrix
+    for any animated object also loses unrelated, unanimated channel edits.
+    """
+    curves = []
+    if animation:
+        actions = [animation.action]
+        actions.extend(strip.action for track in animation.nla_tracks for strip in track.strips)
+        curves.extend(animation.drivers)
+        for action in actions:
+            if action is None:
+                continue
+            curves.extend(getattr(action, 'fcurves', ()))
+            for layer in getattr(action, 'layers', ()):
+                for strip in layer.strips:
+                    for bag in getattr(strip, 'channelbags', ()):
+                        curves.extend(bag.fcurves)
+    animated = {(c.data_path, c.array_index) for c in curves if not c.mute}
+    result = {'rotation_mode': item.rotation_mode}
+    for key in ('location', 'rotation_euler', 'rotation_quaternion', 'rotation_axis_angle',
+                'scale', 'delta_location', 'delta_rotation_euler', 'delta_rotation_quaternion', 'delta_scale'):
+        if hasattr(item, key):
+            result[key] = [(i, value) for i, value in enumerate(getattr(item, key))
+                           if (prefix + key, i) not in animated]
+    return result
+
+
 def signature(scene, obj):
     """Conservative scene signature. External driver inputs need explicit validation."""
     p = obj.quick_cloth
     excluded = {'bake_signature', 'bake_state', 'bake_error', 'bake_metadata', 'bake_needs_validation',
                 'animator_state', 'cage', 'garment', 'show_fabric_detail', 'custom_steps', 'custom_collision', 'diagnostics', 'coverage_text'}
     state = [bpy.app.version_string, rna_values(p, excluded),
-             (scene.render.fps, scene.render.fps_base, tuple(scene.gravity), scene.use_gravity, scene.unit_settings.scale_length)]
+             (scene.render.fps, scene.render.fps_base, tuple(scene.gravity), scene.use_gravity, scene.unit_settings.scale_length),
+             effective_range(scene, p)]
     state.append({k: scene[k] for k in scene.keys() if k not in {'quick_cloth', 'quick_cloth_registry'}})
     for item in sorted(scene.objects, key=lambda o: o.name):
         if item.get('qc_helper') == 'cage':
@@ -193,8 +228,7 @@ def signature(scene, obj):
                 sorted(c.name for c in item.users_collection),
                 {k: item[k] for k in item.keys() if k != 'quick_cloth' and not k.startswith('qc_')},
                 action_data(item.animation_data), [rna_values(c) for c in item.constraints]]
-        if not item.animation_data:
-            data.append([list(row) for row in item.matrix_basis])
+        data.append(static_transform_channels(item, item.animation_data))
         if item.type == 'MESH':
             data.extend([[(tuple(v.co), [(g.group, g.weight) for g in v.groups]) for v in item.data.vertices],
                          [tuple(f.vertices) for f in item.data.polygons],
@@ -205,8 +239,8 @@ def signature(scene, obj):
         if item.type == 'ARMATURE':
             data.append([(b.name, [list(row) for row in b.matrix_local]) for b in item.data.bones])
             data.append([(b.name, [rna_values(c) for c in b.constraints]) for b in item.pose.bones])
-            if not item.animation_data:
-                data.append([(b.name, [list(row) for row in b.matrix_basis]) for b in item.pose.bones])
+            data.append([(b.name, static_transform_channels(b, item.animation_data, b.path_from_id() + '.'))
+                         for b in item.pose.bones])
         data.append([rna_values(m, {'execution_time', 'persistent_uid'}) for m in item.modifiers if m.type != 'CLOTH'])
         if item.collision:
             data.append(rna_values(item.collision))
@@ -240,6 +274,11 @@ def state(context, obj):
             return 'NEEDS_VALIDATION'
         if not isinstance(metadata, dict):
             return 'NEEDS_VALIDATION'
+        try:
+            if effective_range(context.scene, p) != (mod.point_cache.frame_start, mod.point_cache.frame_end):
+                return 'DIRTY'
+        except ValueError:
+            return 'DIRTY'
         if metadata.get('settings') != settings_signature(p) or p.bake_state == 'DIRTY':
             return 'DIRTY'
         if p.bake_needs_validation or not p.bake_signature:

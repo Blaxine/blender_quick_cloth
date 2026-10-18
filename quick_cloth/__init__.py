@@ -920,6 +920,9 @@ def initialize_setup(obj, scene, adopt=False):
             raise ValueError('Existing cloth found. Use Adopt Existing Cloth to preserve its settings.')
         if mod is not None:
             # Reject lossy adoption before touching ANY authored properties.
+            if mod.settings.internal_tension_stiffness != mod.settings.internal_compression_stiffness:
+                raise ValueError('Cannot adopt unequal internal tension/compression stiffness without loss; '
+                                 'Quick Cloth has one internal stiffness control. Original cloth is unchanged.')
             native = {prop.identifier: getattr(mod.settings, prop.identifier)
                       for prop in p.bl_rna.properties
                       if hasattr(mod.settings, prop.identifier)
@@ -1198,7 +1201,7 @@ Existing baked caches require explicit Rebuild Bake"""
         #    each obstacle converted individually).
         if props.use_collision_objects:
             n = convert_obstacles_to_colliders(scene, obj,
-                                               props.object_distance,
+                                               props.collider_thickness,
                                                report=self.report)
             if n:
                 self.report({'INFO'},
@@ -1472,7 +1475,11 @@ class QC_OT_validate_bake(Operator):
         if not obj or not baking.cloth(obj):
             return {'CANCELLED'}
         p = obj.quick_cloth
-        same = bool(p.bake_signature and p.bake_signature == baking.signature(context.scene, obj))
+        try:
+            same = bool(p.bake_signature and p.bake_signature == baking.signature(context.scene, obj))
+        except ValueError:
+            # An invalid requested range cannot match a previously valid bake.
+            same = False
         p.bake_needs_validation = not same
         p.bake_state = 'BAKED' if same else 'DIRTY'
         self.report({'INFO'} if same else {'WARNING'},
