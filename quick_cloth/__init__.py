@@ -206,7 +206,7 @@ PRESETS = {
         "use_self_collision": True,   # mandatory for skin-tight fits
         "self_distance": 0.006,
         "object_distance": 0.015,
-        "fit_tightness": -0.12,       # negative shrink tightens onto the body
+        "fit_tightness": 0.12,        # positive shrink tightens onto the body
         "use_sewing": True,
         "use_internal_springs": False,
         "internal_stiffness": 5.0,
@@ -228,7 +228,7 @@ PRESETS = {
         "use_self_collision": True,
         "self_distance": 0.010,
         "object_distance": 0.015,
-        "fit_tightness": -0.04,       # light hug fit
+        "fit_tightness": 0.04,        # light hug fit
         "use_sewing": False,
         "use_internal_springs": False,
         "internal_stiffness": 5.0,
@@ -297,7 +297,7 @@ PRESET_ITEMS = [
      "only where they crease"),
     ("LATEX", "Latex",
      "Skin-tight latex garments — very stretchy, zero drape, tightens onto "
-     "the body (negative fit + self-collision + sewing)"),
+     "the body (positive shrink + self-collision; sewing only affects loose seam edges)"),
     ("STRETCH_DENIM", "Stretch Denim",
      "Jeans with elastane — gives at the knees, light hug fit"),
     ("RIGID_DENIM", "Cotton Rigid Denim",
@@ -322,6 +322,7 @@ def apply_preset(self, context):
         return
     for key, value in values.items():
         setattr(self, key, value)
+    self.legacy_fit = False
 
     # Push into a live modifier if one exists on the active object.
     obj = self.id_data
@@ -337,6 +338,12 @@ def apply_preset(self, context):
 # PROPERTY GROUP
 # ---------------------------------------------------------------------------
 
+def wind_enabled_update(self, context):
+    for obj, strength in ((self.wind, self.wind_strength), (self.turbulence, self.wind_turbulence)):
+        if owned_helper(obj, self) and obj.field:
+            obj.field.strength = strength if self.use_wind else 0
+
+
 class QuickClothProps(PropertyGroup):
     """Per-garment settings; Scene settings are defaults for new setups only."""
 
@@ -351,6 +358,12 @@ class QuickClothProps(PropertyGroup):
     legacy_fit: BoolProperty(default=False)
     dynamic_mesh: BoolProperty(name='Dynamic Rest Shape', default=False,
                               description='Recompute rest shape for squash/stretch rigs; not required for normal pinned cloth')
+    use_object_collision: BoolProperty(name='Enable Cloth Collisions', default=True)
+    body: PointerProperty(name='Body / Obstacle', type=bpy.types.Object,
+                          poll=lambda self, obj: obj.type == 'MESH')
+    collider_thickness: FloatProperty(name='New Collider Thickness', default=.005, min=.001, max=1, unit='LENGTH')
+    impulse_clamp: FloatProperty(name='Collision Impulse Clamp', default=0, min=0, max=10000)
+    self_impulse_clamp: FloatProperty(name='Self Impulse Clamp', default=0, min=0, max=10000)
 
     preset: EnumProperty(
         name="Fabric Preset",
@@ -464,9 +477,8 @@ class QuickClothProps(PropertyGroup):
     )
     fit_tightness: FloatProperty(
         name="Fit Tightness",
-        description="Shrink factor. NEGATIVE values shrink the garment onto "
-                    "the body (latex, stretch denim); positive values let it "
-                    "slacken. Needs a body collider to hug against",
+        description="Positive values shrink cloth; negative values grow it. "
+                    "Needs a body collider for a tight fit. Existing adopted values are preserved",
         default=0.0, min=-0.3, max=0.3,
     )
     use_sewing: BoolProperty(
@@ -506,7 +518,7 @@ class QuickClothProps(PropertyGroup):
         description="On Simulate, create (or reuse) the QC_Wind force-field "
                     "rig: a Wind empty aimed along the direction below plus a "
                     "parented Turbulence field for gusts",
-        default=False,
+        default=False, update=wind_enabled_update,
     )
     wind_direction: FloatVectorProperty(
         name="Direction",
@@ -541,7 +553,7 @@ class QuickClothProps(PropertyGroup):
 
     # --- Collisions ---------------------------------------------------------
     use_collision_objects: BoolProperty(
-        name="Use Collision Objects",
+        name="Auto-convert Rigid Bodies",
         description="On Simulate, automatically give a Collision modifier to "
                     "every rigid-body mesh in the scene that lacks one, so "
                     "obstacles just work. Each object is converted "
@@ -774,19 +786,20 @@ def configure_cloth_from_props(mod, props, preview=False):
 
     c.distance_min = props.object_distance
     c.self_distance_min = props.self_distance
+    c.use_collision = props.use_object_collision
 
     # Anti-jitter: cap collision repulsion impulses. Unclamped impulses are
     # the main source of at-rest micro-jitter when self-collision or tight
     # collision distances are active (0 = unclamped in Blender, so we set a
     # finite ceiling).
-    c.impulse_clamp = 25.0
-    c.self_impulse_clamp = 25.0
+    c.impulse_clamp = props.impulse_clamp
+    c.self_impulse_clamp = props.self_impulse_clamp
 
     # CRITICAL: no collision collection, ever. Leaving it None makes the
     # cloth interact with EVERY collision object in the scene, each one
     # independently. (The word "collection" appears here only to document
     # that none is used.)
-    c.collection = None
+    # Existing user collision filters remain intact. New Cloth uses its native default.
 
 
 def convert_obstacles_to_colliders(scene, cloth_obj, object_distance, report=None):
@@ -805,83 +818,85 @@ def convert_obstacles_to_colliders(scene, cloth_obj, object_distance, report=Non
             continue
         if any(m.type == 'COLLISION' for m in obj.modifiers):
             continue
-        if obj.library is not None:
+        if object_is_override_locked(obj):
             # Linked data can't take new modifiers; skip quietly but note it.
             if report is not None:
                 report({'WARNING'}, f"Skipped linked object '{obj.name}' — "
                                     "can't add a Collision modifier to linked data")
             continue
-        obj.modifiers.new(name="QC Collision", type='COLLISION')
-        col = obj.collision
-        if col is not None:
-            col.thickness_outer = 0.02
-            col.damping = 0.1
+        make_collider(obj, object_distance)
         converted += 1
     return converted
 
 
-def make_collider(obj):
+def make_collider(obj, thickness=.005):
     """Add (or reuse) a tuned Collision modifier on a single object.
     Never touches the rest of the modifier stack — rigged meshes stay
     rigged."""
-    if not any(m.type == 'COLLISION' for m in obj.modifiers):
-        obj.modifiers.new(name="QC Collision", type='COLLISION')
-    col = obj.collision
-    if col is not None:
-        col.thickness_outer = 0.02
-        col.damping = 0.1
+    if object_is_override_locked(obj):
+        raise ValueError(f'{obj.name}: collider object is not editable')
+    existing = next((m for m in obj.modifiers if m.type == 'COLLISION'), None)
+    if existing is not None:
+        return existing
+    mod = obj.modifiers.new(name="QC Collision", type='COLLISION')
+    obj['qc_collision_created'] = True
+    if obj.collision is not None:
+        obj.collision.thickness_outer = thickness
+        obj.collision.damping = 0.1
+    return mod
+
+
+def owned_helper(obj, props):
+    return bool(obj and obj.get('qc_owner') == props.setup_id and props.setup_id)
 
 
 def ensure_wind_rig(context, props):
-    """Create or reuse (found by name — idempotent) the QC_Wind rig:
-    a Wind force-field empty aimed along the user direction, with a
-    Turbulence field parented to it. Returns the wind object."""
-    scene = context.scene
-
-    wind = bpy.data.objects.get(WIND_EMPTY_NAME)
-    if wind is None or wind.name not in scene.objects:
-        if wind is None:
-            wind = bpy.data.objects.new(WIND_EMPTY_NAME, None)
-            wind.empty_display_type = 'SINGLE_ARROW'
-            wind.empty_display_size = 1.5
-        if wind.name not in scene.collection.all_objects:
-            context.collection.objects.link(wind)
-
-    wind.field.type = 'WIND'
-    wind.field.strength = props.wind_strength
-    wind.field.shape = 'PLANE'
-
-    # Aim the empty's +Z along the requested direction (wind blows along
-    # local Z).
-    direction = Vector(props.wind_direction)
-    if direction.length < 1e-6:
-        direction = Vector((1.0, 0.0, 0.0))
-    quat = direction.normalized().to_track_quat('Z', 'Y')
-    wind.rotation_euler = quat.to_euler()
-
-    turb = bpy.data.objects.get(TURBULENCE_EMPTY_NAME)
-    if turb is None:
-        turb = bpy.data.objects.new(TURBULENCE_EMPTY_NAME, None)
-        turb.empty_display_type = 'SPHERE'
-        turb.empty_display_size = 0.75
-    if turb.name not in scene.collection.all_objects:
-        context.collection.objects.link(turb)
-    turb.parent = wind
-
-    turb.field.type = 'TURBULENCE'
-    turb.field.strength = props.wind_turbulence
-    turb.field.seed = props.wind_seed
-    return wind
+    if not props.setup_id:
+        raise ValueError('Set up the garment before adding wind')
+    selected = list(context.selected_objects)
+    active = context.view_layer.objects.active
+    try:
+        for attr, kind, label in (('wind', 'WIND', 'QC Wind'),
+                                  ('turbulence', 'TURBULENCE', 'QC Turbulence')):
+            obj = getattr(props, attr)
+            if not owned_helper(obj, props):
+                bpy.ops.object.effector_add(type=kind, location=(0, 0, 0))
+                obj = context.object
+                obj.name = label
+                obj['qc_owner'] = props.setup_id
+                setattr(props, attr, obj)
+            if obj.field is None or obj.field.type != kind:
+                raise ValueError(f'{obj.name}: owned force field was changed; remove and recreate it')
+        wind, turb = props.wind, props.turbulence
+        direction = Vector(props.wind_direction)
+        if direction.length < 1e-6:
+            raise ValueError('Wind direction cannot be zero')
+        if wind.parent or wind.constraints:
+            raise ValueError('Owned wind has a parent/constraint; remove it before using world-space direction')
+        wind.rotation_euler = direction.normalized().to_track_quat('Z', 'Y').to_euler()
+        wind.field.strength = props.wind_strength if props.use_wind else 0
+        turb.parent = wind
+        turb.field.strength = props.wind_turbulence if props.use_wind else 0
+        turb.field.seed = props.wind_seed
+        return wind
+    finally:
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        for obj in selected:
+            if obj.name in context.view_layer.objects:
+                obj.select_set(True)
+        context.view_layer.objects.active = active
 
 
 def remove_wind_rig(context):
-    """Delete the QC_Wind rig (wind + turbulence empties) if present."""
+    props = get_props(context)
     removed = 0
-    for name in (TURBULENCE_EMPTY_NAME, WIND_EMPTY_NAME):
-        obj = bpy.data.objects.get(name)
-        if obj is not None:
+    for attr in ('turbulence', 'wind'):
+        obj = getattr(props, attr)
+        if owned_helper(obj, props):
             bpy.data.objects.remove(obj, do_unlink=True)
             removed += 1
+        setattr(props, attr, None)
     return removed
 
 
@@ -972,6 +987,9 @@ def initialize_setup(obj, scene, adopt=False):
                 if hasattr(s, native) and isinstance(getattr(s, native), (int, float, bool)):
                     setattr(p, key, getattr(s, native))
             p.use_self_collision = c.use_self_collision
+            p.use_object_collision = c.use_collision
+            p.impulse_clamp = c.impulse_clamp
+            p.self_impulse_clamp = c.self_impulse_clamp
             p.collision_quality = c.collision_quality
             p.object_distance = c.distance_min
             p.self_distance = c.self_distance_min
@@ -1182,8 +1200,12 @@ Idempotent — run it as often as you like"""
                             "modifier")
 
         # 6. Wind rig (found by name — idempotent).
-        if props.use_wind:
-            ensure_wind_rig(context, props)
+        if props.use_wind or props.wind:
+            try:
+                ensure_wind_rig(context, props)
+            except ValueError as exc:
+                self.report({'ERROR'}, str(exc))
+                return {'CANCELLED'}
 
         # 7. Frame range: shot range from the panel (or the timeline's
         #    preview range), minus the settle pre-roll.
@@ -1386,6 +1408,25 @@ correctly). Idempotent"""
         return {'FINISHED'}
 
 
+class QC_OT_body_collider(Operator):
+    """Enable collision on the chosen body without adding rigid-body physics"""
+    bl_idname = 'quick_cloth.body_collider'
+    bl_label = 'Make Body Collider'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        p = get_props(context)
+        if p.body is None or p.body == context.active_object:
+            self.report({'ERROR'}, 'Choose a separate mesh body/obstacle')
+            return {'CANCELLED'}
+        try:
+            make_collider(p.body, p.collider_thickness)
+        except ValueError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 class QC_OT_remove_wind(Operator):
     """Delete the QC_Wind rig (the wind and turbulence empties)"""
     bl_idname = "quick_cloth.remove_wind"
@@ -1394,8 +1435,8 @@ class QC_OT_remove_wind(Operator):
 
     @classmethod
     def poll(cls, context):
-        return (bpy.data.objects.get(WIND_EMPTY_NAME) is not None
-                or bpy.data.objects.get(TURBULENCE_EMPTY_NAME) is not None)
+        props = get_props(context)
+        return owned_helper(props.wind, props) or owned_helper(props.turbulence, props)
 
     def execute(self, context):
         removed = remove_wind_rig(context)
@@ -1727,6 +1768,8 @@ class QC_PT_panel(Panel):
             box.label(text=f'Attachment coverage: {weighted}/{total} vertices')
         box.prop(props, 'dynamic_mesh')
         box.prop(props, "fit_tightness")
+        if props.legacy_fit:
+            box.label(text='Adopted shrink value preserved; positive shrinks', icon='INFO')
         row = box.row(align=True)
         row.prop(props, "use_sewing")
         sub = row.row()
@@ -1747,15 +1790,21 @@ class QC_PT_panel(Panel):
             box.prop(props, "wind_strength")
             box.prop(props, "wind_turbulence")
             box.prop(props, "wind_seed")
-            box.operator("quick_cloth.remove_wind", icon='X')
+        box.operator("quick_cloth.remove_wind", icon='X')
         box.prop(props, "gravity_influence")
 
         # 5. Collisions box.
         box = layout.box()
         box.label(text="Collisions", icon='PHYSICS')
+        box.prop(props, 'use_object_collision')
+        box.prop(props, 'body')
+        box.prop(props, 'collider_thickness')
+        box.operator('quick_cloth.body_collider')
         box.prop(props, "use_collision_objects")
         box.operator("quick_cloth.make_colliders", icon='MESH_ICOSPHERE')
         box.prop(props, "object_distance")
+        box.prop(props, 'impulse_clamp')
+        box.prop(props, 'self_impulse_clamp')
         row = box.row(align=True)
         row.prop(props, "use_self_collision")
         sub = row.row()
@@ -1811,6 +1860,7 @@ classes = (
     QC_OT_set_pin_group,
     QC_OT_pin_from_rig_weights,
     QC_OT_make_colliders,
+    QC_OT_body_collider,
     QC_OT_remove_wind,
     QC_OT_bake,
     QC_OT_free_bake,
