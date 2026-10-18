@@ -53,6 +53,7 @@ from bpy.props import (
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector
 from .validation import geometry_issues, pin_coverage, validate_pin_edit
+from .quality import resolve as resolve_quality, selection_update as quality_update, values_update as quality_values_update
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -321,8 +322,10 @@ def apply_preset(self, context):
     if values is None:
         return
     for key, value in values.items():
-        setattr(self, key, value)
+        if key not in {'quality_steps', 'collision_quality'}:
+            setattr(self, key, value)
     self.legacy_fit = False
+    quality_update(self, context)
 
     # Push into a live modifier if one exists on the active object.
     obj = self.id_data
@@ -356,6 +359,8 @@ class QuickClothProps(PropertyGroup):
     turbulence: PointerProperty(type=bpy.types.Object)
     animator_state: StringProperty()
     legacy_fit: BoolProperty(default=False)
+    custom_steps: IntProperty(default=12, min=1, max=80)
+    custom_collision: IntProperty(default=5, min=1, max=20)
     dynamic_mesh: BoolProperty(name='Dynamic Rest Shape', default=False,
                               description='Recompute rest shape for squash/stretch rigs; not required for normal pinned cloth')
     use_object_collision: BoolProperty(name='Enable Cloth Collisions', default=True)
@@ -582,20 +587,14 @@ class QuickClothProps(PropertyGroup):
 
     # --- Simulation ---------------------------------------------------------
     quality_mode: EnumProperty(
-        name="Quality Mode",
-        description="Preview halves Quality Steps and Collision Quality and "
-                    "disables self-collision (unless the preset mandates it, "
-                    "like Latex) — non-destructively, at configure time. "
-                    "Final uses your stored values verbatim",
-        items=[
-            ("PREVIEW", "Preview",
-             "Fast blocking quality: halved steps, self-collision off unless "
-             "the preset requires it. Your stored slider values are untouched"),
-            ("FINAL", "Final",
-             "Full quality using the stored values verbatim — flip to this "
-             "before baking"),
-        ],
-        default="FINAL",
+        name='Simulation Quality',
+        description='Numerical solver quality; physical fabric settings and collision policy stay unchanged',
+        items=[('PREVIEW', 'Preview', 'Timing and broad motion', 0),
+               ('FINAL', 'Legacy Final', 'Preserved legacy authored values', 1),
+               ('MEDIUM', 'Medium', 'Balanced iteration', 2),
+               ('HIGH', 'High', 'Tight contact and faster motion', 3),
+               ('CUSTOM', 'Custom', 'Explicit authored steps and iterations', 4)],
+        default='MEDIUM', update=quality_update,
     )
     frame_start: IntProperty(
         name="Start Frame",
@@ -630,13 +629,13 @@ class QuickClothProps(PropertyGroup):
         description="Simulation substeps per frame. The main speed/accuracy "
                     "dial: scale it down for viewport previews, up for final "
                     "bakes. Too low = stretchy, unstable cloth",
-        default=5, min=1, max=80,
+        default=12, min=1, max=80, update=quality_values_update,
     )
     collision_quality: IntProperty(
         name="Collision Quality",
         description="Collision solver iterations. Raise it if fast-moving "
                     "cloth tunnels through obstacles",
-        default=3, min=1, max=20,
+        default=5, min=1, max=20, update=quality_values_update,
     )
     use_disk_cache: BoolProperty(
         name="Disk Cache",
@@ -762,27 +761,9 @@ def configure_cloth_from_props(mod, props, preview=False):
     s.pin_stiffness = props.pin_stiffness
     s.use_dynamic_mesh = props.dynamic_mesh
 
-    # Quality — Preview halves steps (min 3) and collision quality (min 2)
-    # and drops self-collision unless the preset mandates it (LATEX).
-    if preview:
-        # Stiffness-aware floor: stiff springs oscillate (jitter) when the
-        # substep count is too low for them, so Preview may halve the steps
-        # but never below what the fabric's stiffness can tolerate.
-        stiffness = max(props.tension_stiffness, props.bending_stiffness)
-        if stiffness >= 50.0:
-            steps_floor = 8
-        elif stiffness >= 20.0:
-            steps_floor = 6
-        else:
-            steps_floor = 3
-        s.quality = max(steps_floor, props.quality_steps // 2)
-        c.collision_quality = max(2, props.collision_quality // 2)
-        preset_mandates_self = PRESETS.get(props.preset, {}).get("use_self_collision", False) and props.preset == 'LATEX'
-        c.use_self_collision = props.use_self_collision if preset_mandates_self else False
-    else:
-        s.quality = props.quality_steps
-        c.collision_quality = props.collision_quality
-        c.use_self_collision = props.use_self_collision
+    # One resolver for setup, preset refresh, UI and baking.
+    s.quality, c.collision_quality = resolve_quality(props)
+    c.use_self_collision = props.use_self_collision
 
     c.distance_min = props.object_distance
     c.self_distance_min = props.self_distance
@@ -998,6 +979,9 @@ def initialize_setup(obj, scene, adopt=False):
             p.frame_start, p.frame_end = mod.point_cache.frame_start, mod.point_cache.frame_end
             p.settle_frames = 0
             p.legacy_fit = True
+            p.quality_mode = 'CUSTOM'
+            p.quality_steps = s.quality
+            p.collision_quality = c.collision_quality
         p.setup_id = uuid.uuid4().hex
         p.data_version = 1
     elif any(o != obj and o.type == 'MESH' and o.quick_cloth.setup_id == p.setup_id
@@ -1006,6 +990,19 @@ def initialize_setup(obj, scene, adopt=False):
         p.cage = p.wind = p.turbulence = None
         p.animator_state = ''
     return p
+
+
+class QC_OT_quality(Operator):
+    bl_idname = 'quick_cloth.quality'
+    bl_label = 'Set Simulation Quality'
+    bl_options = {'REGISTER', 'UNDO'}
+    tier: StringProperty()
+
+    def execute(self, context):
+        if self.tier not in {'PREVIEW', 'MEDIUM', 'HIGH', 'CUSTOM'}:
+            return {'CANCELLED'}
+        get_props(context).quality_mode = self.tier
+        return {'FINISHED'}
 
 
 class QC_OT_adopt(Operator):
@@ -1815,7 +1812,11 @@ class QC_PT_panel(Panel):
         box = layout.box()
         box.label(text="Simulation", icon='SCENE_DATA')
         row = box.row(align=True)
-        row.prop(props, "quality_mode", expand=True)
+        for tier in ('PREVIEW', 'MEDIUM', 'HIGH', 'CUSTOM'):
+            op = row.operator('quick_cloth.quality', text=tier.title(), depress=props.quality_mode == tier)
+            op.tier = tier
+        steps, collisions = resolve_quality(props)
+        box.label(text=f'Effective: {steps} solver steps / {collisions} collision iterations')
         box.prop(props, "frame_start")
         box.prop(props, "frame_end")
         box.prop(props, "settle_frames")
@@ -1856,6 +1857,7 @@ class QC_PT_panel(Panel):
 classes = (
     QuickClothProps,
     QC_OT_adopt,
+    QC_OT_quality,
     QC_OT_simulate,
     QC_OT_set_pin_group,
     QC_OT_pin_from_rig_weights,
