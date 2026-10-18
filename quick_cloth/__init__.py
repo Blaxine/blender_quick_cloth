@@ -41,6 +41,8 @@ bl_info = {
 import bpy
 import uuid
 import json
+from datetime import datetime, timezone
+from . import baking
 from bpy.props import (
     BoolProperty,
     EnumProperty,
@@ -359,6 +361,11 @@ class QuickClothProps(PropertyGroup):
     turbulence: PointerProperty(type=bpy.types.Object)
     animator_state: StringProperty()
     legacy_fit: BoolProperty(default=False)
+    bake_signature: StringProperty()
+    bake_state: StringProperty(default='READY')
+    bake_error: StringProperty()
+    bake_metadata: StringProperty()
+    bake_needs_validation: BoolProperty(default=False)
     custom_steps: IntProperty(default=12, min=1, max=80)
     custom_collision: IntProperty(default=5, min=1, max=20)
     dynamic_mesh: BoolProperty(name='Dynamic Rest Shape', default=False,
@@ -616,7 +623,7 @@ class QuickClothProps(PropertyGroup):
                     "down automatically if needed (the cache must always be "
                     "reachable on the timeline). Animate the character "
                     "holding its first pose during the settle window",
-        default=15, min=0, max=120,
+        default=0, min=0, max=120,
     )
     use_preview_range: BoolProperty(
         name="Use Preview Range",
@@ -882,43 +889,15 @@ def remove_wind_rig(context):
 
 
 def cache_hygiene(context, scene, cache, sim_start, sim_end, report=None):
-    """Point caches silently kill simulations when misconfigured.
-    (Hard-won lesson from Quick Break.)
-
-    * Clamp the cache start so it NEVER sits on a frame the timeline cannot
-      reach — otherwise the sim never initializes and the cloth freezes.
-    * Extend the cache end to cover the sim.
-    * Free stale bakes so old cached data can't freeze the new setup.
-    * Rewind the playhead to the sim start if it sits past it — cloth only
-      computes forward.
-    """
-    if sim_start < scene.frame_start:
-        if report is not None:
-            report({'WARNING'},
-                   f"Simulation start ({sim_start}) is before the scene "
-                   f"start ({scene.frame_start}) — extending the scene start "
-                   "down so the cache stays reachable")
-        scene.frame_start = sim_start
-
+    if cache.is_baked or cache.is_baking:
+        raise ValueError('Existing baked/running cache: use Rebuild Bake or Free Bake first')
+    if sim_start < 0 or sim_end < max(1, sim_start):
+        raise ValueError('Invalid simulation range; negative pre-roll is not supported')
     cache.frame_start = sim_start
-    # Belt-and-braces clamp: the cache must never start before a reachable
-    # frame.
-    cache.frame_start = max(scene.frame_start,
-                            min(cache.frame_start, sim_start))
-    cache.frame_end = max(scene.frame_end, sim_end)
-
-    # Free any stale bake (version-fragile op → guarded, per architecture
-    # rules).
-    try:
-        with context.temp_override(scene=scene, point_cache=cache):
-            bpy.ops.ptcache.free_bake()
-    except Exception:
-        pass
-
-    # Cloth only computes forward: rewind the playhead if it's past the
-    # start.
-    if scene.frame_current > cache.frame_start:
-        scene.frame_set(max(scene.frame_start, cache.frame_start))
+    cache.frame_end = sim_end
+    if (cache.frame_start, cache.frame_end) != (sim_start, sim_end):
+        raise ValueError('Blender clamped the requested cache range')
+    scene.frame_set(sim_start)
 
 
 def object_is_override_locked(obj):
@@ -1131,6 +1110,18 @@ Idempotent — run it as often as you like"""
     def execute(self, context):
         scene = context.scene
         obj = context.active_object
+        if baking.any_baking():
+            self.report({'ERROR'}, 'Wait for the running cloth bake')
+            return {'CANCELLED'}
+        existing = find_cloth_modifier(obj)
+        if existing and existing.point_cache.is_baked:
+            self.report({'ERROR'}, 'A baked cache exists. Use Rebuild Bake to replace it explicitly.')
+            return {'CANCELLED'}
+        try:
+            baking.effective_range(scene, obj.quick_cloth)
+        except ValueError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
         errors, warnings = geometry_issues(obj)
         if errors:
             self.report({'ERROR'}, '; '.join(errors))
@@ -1206,14 +1197,7 @@ Idempotent — run it as often as you like"""
 
         # 7. Frame range: shot range from the panel (or the timeline's
         #    preview range), minus the settle pre-roll.
-        if (props.use_preview_range and scene.use_preview_range):
-            shot_start = scene.frame_preview_start
-            shot_end = scene.frame_preview_end
-        else:
-            shot_start = props.frame_start
-            shot_end = props.frame_end
-        sim_start = shot_start - props.settle_frames
-        sim_end = max(shot_end, sim_start + 1)
+        sim_start, sim_end = baking.effective_range(scene, props)
 
         # 8. Cache hygiene + disk cache.
         cache = mod.point_cache
@@ -1221,7 +1205,7 @@ Idempotent — run it as often as you like"""
                       report=self.report)
         cache.use_disk_cache = props.use_disk_cache
         if props.use_disk_cache:
-            cache.use_library_path = True
+            cache.use_library_path = False
 
         self.report({'INFO'},
                     f"Cloth configured on '{obj.name}' "
@@ -1441,67 +1425,151 @@ class QC_OT_remove_wind(Operator):
         return {'FINISHED'}
 
 
+class QC_OT_validate_bake(Operator):
+    bl_idname = 'quick_cloth.validate_bake'
+    bl_label = 'Validate Cache Dependencies'
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or not baking.cloth(obj):
+            return {'CANCELLED'}
+        p = obj.quick_cloth
+        same = bool(p.bake_signature and p.bake_signature == baking.signature(context.scene, obj))
+        p.bake_needs_validation = not same
+        p.bake_state = 'BAKED' if same else 'DIRTY'
+        self.report({'INFO'} if same else {'WARNING'},
+                    'Recorded dependencies match; verify external driver inputs and visual result' if same
+                    else 'Dependencies differ or cache has no recorded signature; rebuild the bake')
+        return {'FINISHED'}
+
+
 class QC_OT_bake(Operator):
-    """Bake the cloth simulation to its point cache (respects the Disk
-Cache setting). Flip Quality Mode to Final first"""
-    bl_idname = "quick_cloth.bake"
-    bl_label = "Bake"
-    bl_options = {'REGISTER'}
+    """Validate, apply current settings, and bake exactly the displayed range"""
+    bl_idname = 'quick_cloth.bake'
+    bl_label = 'Bake Cloth'
+    rebuild: BoolProperty(default=False)
+    _timer = None
+    _ticks = 0
 
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return (obj is not None and obj.type == 'MESH'
-                and find_cloth_modifier(obj) is not None)
+        if not obj or obj.type != 'MESH':
+            return False
+        errors, _ = baking.preflight(context, obj)
+        if errors:
+            cls.poll_message_set(errors[0])
+        return not errors
+
+    def invoke(self, context, event):
+        self._interactive = True
+        if self.rebuild:
+            return context.window_manager.invoke_confirm(self, event)
+        return self.execute(context)
 
     def execute(self, context):
         obj = context.active_object
-        mod = find_cloth_modifier(obj)
-        cache = mod.point_cache
-        cache.use_disk_cache = get_props(context).use_disk_cache
-        if cache.use_disk_cache:
-            cache.use_library_path = True
-        # ptcache is version-fragile → guarded temp_override, per
-        # architecture rules.
-        try:
-            with context.temp_override(scene=context.scene,
-                                       active_object=obj,
-                                       point_cache=cache):
-                bpy.ops.ptcache.bake(bake=True)
-        except Exception as exc:
-            self.report({'ERROR'}, f"Bake failed: {exc}")
+        errors, warnings = baking.preflight(context, obj, storage=True)
+        if errors:
+            self.report({'ERROR'}, '; '.join(errors))
             return {'CANCELLED'}
-        self.report({'INFO'},
-                    f"Baked frames {cache.frame_start}–{cache.frame_end}"
-                    + (" to disk cache" if cache.use_disk_cache else ""))
+        for warning in warnings:
+            self.report({'WARNING'}, warning)
+        p, mod = obj.quick_cloth, find_cloth_modifier(obj)
+        if mod.point_cache.is_baked and not self.rebuild:
+            self.report({'ERROR'}, 'A usable bake exists. Choose Rebuild Bake explicitly.')
+            return {'CANCELLED'}
+        self._obj = obj
+        self._scene = context.scene
+        self._frame = context.scene.frame_current
+        try:
+            if mod.point_cache.is_baked:
+                baking.free(context, obj)
+            configure_cloth_from_props(mod, p)
+            ensure_stack_order(obj)
+            mod.settings.vertex_group_mass = p.pin_group
+            start, end = baking.effective_range(context.scene, p)
+            cache_hygiene(context, context.scene, mod.point_cache, start, end)
+            mod.point_cache.use_disk_cache = p.use_disk_cache
+            mod.point_cache.use_library_path = False
+            p.bake_state, p.bake_error = 'BAKING', ''
+            with context.temp_override(object=obj, active_object=obj, point_cache=mod.point_cache):
+                if getattr(self, '_interactive', False) and not bpy.app.background:
+                    result = bpy.ops.ptcache.bake('INVOKE_DEFAULT', bake=True)
+                else:
+                    result = bpy.ops.ptcache.bake(bake=True)
+            if result == {'CANCELLED'}:
+                p.bake_state = 'CANCELLED'
+                self._scene.frame_set(self._frame)
+                self.report({'WARNING'}, 'Bake cancelled; no complete cache recorded')
+                return {'CANCELLED'}
+            if getattr(self, '_interactive', False) and not bpy.app.background:
+                self._timer = context.window_manager.event_timer_add(.5, window=context.window)
+                context.window_manager.modal_handler_add(self)
+                return {'RUNNING_MODAL'}
+            return self.finish(context)
+        except Exception as exc:
+            p.bake_state, p.bake_error = 'FAILED', str(exc)
+            self._scene.frame_set(self._frame)
+            self.report({'ERROR'}, f'Bake failed: {exc}')
+            return {'CANCELLED'}
+
+    def modal(self, context, event):
+        if event.type == 'TIMER':
+            self._ticks += 1
+            if not self._obj or not find_cloth_modifier(self._obj):
+                self.cleanup(context)
+                return {'CANCELLED'}
+            if not find_cloth_modifier(self._obj).point_cache.is_baking and self._ticks > 2:
+                self.cleanup(context)
+                return self.finish(context)
+            for area in context.screen.areas:
+                area.tag_redraw()
+        # Pass Escape through to Blender's native point-cache job.
+        return {'PASS_THROUGH'}
+
+    def cleanup(self, context):
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+
+    def finish(self, context):
+        obj, p = self._obj, self._obj.quick_cloth
+        cache = find_cloth_modifier(obj).point_cache
+        expected = baking.effective_range(self._scene, p)
+        self._scene.frame_set(self._frame)
+        if not cache.is_baked or cache.is_baking or (cache.frame_start, cache.frame_end) != expected:
+            p.bake_state = 'CANCELLED'
+            self.report({'WARNING'}, 'Bake incomplete or cancelled; no complete result recorded')
+            return {'CANCELLED'}
+        p.bake_state = 'BAKED'
+        p.bake_signature = baking.signature(self._scene, obj)
+        p.bake_metadata = json.dumps({'tier': p.quality_mode, 'range': expected,
+                                     'blender': bpy.app.version_string,
+                                     'utc': datetime.now(timezone.utc).isoformat(),
+                                     'settings': baking.settings_signature(p)})
+        p.bake_needs_validation = False
+        self.report({'INFO'}, f'Baked {p.quality_mode.title()} frames {expected[0]}–{expected[1]}')
         return {'FINISHED'}
 
 
 class QC_OT_free_bake(Operator):
-    """Free the baked cloth cache so the simulation recalculates live"""
-    bl_idname = "quick_cloth.free_bake"
-    bl_label = "Free Bake"
-    bl_options = {'REGISTER'}
+    bl_idname = 'quick_cloth.free_bake'
+    bl_label = 'Free Bake'
 
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return (obj is not None and obj.type == 'MESH'
-                and find_cloth_modifier(obj) is not None)
+        mod = baking.cloth(obj) if obj and obj.type == 'MESH' else None
+        return bool(mod and obj.quick_cloth.setup_id and mod.point_cache.is_baked and not baking.any_baking())
 
     def execute(self, context):
-        obj = context.active_object
-        mod = find_cloth_modifier(obj)
-        cache = mod.point_cache
         try:
-            with context.temp_override(scene=context.scene,
-                                       active_object=obj,
-                                       point_cache=cache):
-                bpy.ops.ptcache.free_bake()
+            baking.free(context, context.active_object)
         except Exception as exc:
-            self.report({'ERROR'}, f"Free bake failed: {exc}")
+            self.report({'ERROR'}, f'Free Bake failed: {exc}')
             return {'CANCELLED'}
-        self.report({'INFO'}, "Freed the baked cache")
+        self.report({'INFO'}, 'Freed the target cloth cache')
         return {'FINISHED'}
 
 
@@ -1714,6 +1782,7 @@ class QC_PT_panel(Panel):
 
     def draw(self, context):
         layout = self.layout
+        layout.enabled = not baking.any_baking()
         props = get_props(context)
         obj = context.active_object
         if obj and obj.type == 'MESH' and not props.setup_id and find_cloth_modifier(obj):
@@ -1825,8 +1894,31 @@ class QC_PT_panel(Panel):
         box.prop(props, "collision_quality")
         box.prop(props, "use_disk_cache")
         row = box.row(align=True)
-        row.operator("quick_cloth.bake", icon='RENDER_ANIMATION')
+        state = baking.state(context, obj) if obj and obj.type == 'MESH' else 'NO_SETUP'
+        box.label(text=f'Cache: {state.replace("_", " ").title()}')
+        if state == 'BAKING':
+            box.label(text='Native bake running — press Esc to cancel')
+        errors, warnings = baking.preflight(context, obj) if obj and obj.type == 'MESH' else (['Select a mesh'], [])
+        for error in errors[:4]:
+            box.label(text=error, icon='ERROR')
+        for warning in warnings[:3]:
+            box.label(text=warning, icon='INFO')
+        mod = baking.cloth(obj) if obj and obj.type == 'MESH' else None
+        rebuild = bool(mod and mod.point_cache.is_baked)
+        op = row.operator('quick_cloth.bake', text='Rebuild Bake' if rebuild else f'Bake {props.quality_mode.title()}', icon='RENDER_ANIMATION')
+        op.rebuild = rebuild
         row.operator("quick_cloth.free_bake", icon='TRASH')
+        if rebuild:
+            box.operator('quick_cloth.validate_bake')
+        if props.bake_error:
+            box.label(text=props.bake_error, icon='ERROR')
+        try:
+            start, end = baking.effective_range(context.scene, props)
+            box.label(text=f'Simulation: {start}–{end} ({end-start+1} frames)')
+            if props.use_disk_cache:
+                box.label(text=str(baking.cache_directory()))
+        except ValueError as exc:
+            box.label(text=str(exc), icon='ERROR')
         box.operator("quick_cloth.apply_as_shape", icon='MESH_DATA')
         box.operator("quick_cloth.bind_render_mesh", icon='MOD_MESHDEFORM')
 
@@ -1865,6 +1957,7 @@ classes = (
     QC_OT_body_collider,
     QC_OT_remove_wind,
     QC_OT_bake,
+    QC_OT_validate_bake,
     QC_OT_free_bake,
     QC_OT_apply_as_shape,
     QC_OT_bind_render_mesh,
@@ -1884,12 +1977,18 @@ def register():
             _registered.append(cls)
         bpy.types.Scene.quick_cloth = PointerProperty(type=QuickClothProps)
         bpy.types.Object.quick_cloth = PointerProperty(type=QuickClothProps)
+        bpy.app.handlers.load_post.append(baking.on_load)
+        bpy.app.handlers.depsgraph_update_post.append(baking.on_update)
     except Exception:
         unregister()
         raise
 
 
 def unregister():
+    for handlers, callback in ((bpy.app.handlers.load_post, baking.on_load),
+                               (bpy.app.handlers.depsgraph_update_post, baking.on_update)):
+        if callback in handlers:
+            handlers.remove(callback)
     if hasattr(bpy.types.Scene, "quick_cloth"):
         del bpy.types.Scene.quick_cloth
     if hasattr(bpy.types.Object, 'quick_cloth'):
