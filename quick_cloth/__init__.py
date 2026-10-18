@@ -39,6 +39,8 @@ bl_info = {
 # ---------------------------------------------------------------------------
 
 import bpy
+import uuid
+import json
 from bpy.props import (
     BoolProperty,
     EnumProperty,
@@ -46,6 +48,7 @@ from bpy.props import (
     FloatVectorProperty,
     IntProperty,
     PointerProperty,
+    StringProperty,
 )
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector
@@ -320,10 +323,12 @@ def apply_preset(self, context):
         setattr(self, key, value)
 
     # Push into a live modifier if one exists on the active object.
-    obj = getattr(context, "active_object", None)
-    if obj is not None and obj.type == 'MESH':
+    obj = self.id_data
+    if isinstance(obj, bpy.types.Object) and obj.type == 'MESH' and self.setup_id:
+        if object_is_override_locked(obj):
+            return
         mod = find_cloth_modifier(obj)
-        if mod is not None:
+        if mod is not None and not mod.point_cache.is_baked and not mod.point_cache.is_baking:
             configure_cloth_from_props(mod, self, preview=(self.quality_mode == 'PREVIEW'))
 
 
@@ -332,7 +337,17 @@ def apply_preset(self, context):
 # ---------------------------------------------------------------------------
 
 class QuickClothProps(PropertyGroup):
-    """All Quick Cloth settings, stored on the Scene."""
+    """Per-garment settings; Scene settings are defaults for new setups only."""
+
+    setup_id: StringProperty()
+    data_version: IntProperty(default=0)
+    pin_group: StringProperty(name="Attachment Group")
+    cage: PointerProperty(type=bpy.types.Object)
+    garment: PointerProperty(type=bpy.types.Object)
+    wind: PointerProperty(type=bpy.types.Object)
+    turbulence: PointerProperty(type=bpy.types.Object)
+    animator_state: StringProperty()
+    legacy_fit: BoolProperty(default=False)
 
     preset: EnumProperty(
         name="Fabric Preset",
@@ -908,7 +923,89 @@ def cache_hygiene(context, scene, cache, sim_start, sim_end, report=None):
 
 def object_is_override_locked(obj):
     """True for linked or library-override data we must not edit."""
-    return obj.library is not None or obj.override_library is not None
+    return (obj is None or not obj.is_editable
+            or (obj.override_library is not None and obj.override_library.is_system_override))
+
+
+def get_props(context):
+    obj = context.active_object
+    if obj is not None and obj.type == 'MESH':
+        garment = obj.quick_cloth.garment
+        return (garment or obj).quick_cloth
+    return context.scene.quick_cloth
+
+
+def initialize_setup(obj, scene, adopt=False):
+    """Explicit adoption preserves live values; never migrate by panel draw."""
+    if object_is_override_locked(obj):
+        raise ValueError('Object is not editable')
+    p = obj.quick_cloth
+    mod = find_cloth_modifier(obj)
+    if not p.setup_id:
+        if mod is not None and not adopt:
+            raise ValueError('Existing cloth found. Use Adopt Existing Cloth to preserve its settings.')
+        # New setups use scene defaults; adoption reads the live modifier below.
+        excluded = {'rna_type', 'setup_id', 'data_version', 'cage', 'garment', 'wind',
+                    'turbulence', 'animator_state', 'legacy_fit', 'preset'}
+        for prop in p.bl_rna.properties:
+            key = prop.identifier
+            if key not in excluded and not prop.is_readonly and prop.type != 'POINTER' and not p.is_property_set(key):
+                setattr(p, key, getattr(scene.quick_cloth, key))
+        # Avoid firing the fabric callback during migration.
+        if not p.is_property_set('preset'):
+            p['preset'] = scene.quick_cloth['preset'] if 'preset' in scene.quick_cloth else 0
+        if mod is not None:
+            s, c = mod.settings, mod.collision_settings
+            mapping = {'fit_tightness': 'shrink_min', 'use_sewing': 'use_sewing_springs',
+                       'sewing_force': 'sewing_force_max', 'pressure_force': 'uniform_pressure_force',
+                       'pressure_target_volume': 'target_volume', 'quality_steps': 'quality',
+                       'internal_stiffness': 'internal_tension_stiffness'}
+            for prop in p.bl_rna.properties:
+                key = prop.identifier
+                if key in excluded or prop.is_readonly or prop.type == 'POINTER':
+                    continue
+                native = mapping.get(key, key)
+                if hasattr(s, native) and isinstance(getattr(s, native), (int, float, bool)):
+                    setattr(p, key, getattr(s, native))
+            p.use_self_collision = c.use_self_collision
+            p.collision_quality = c.collision_quality
+            p.object_distance = c.distance_min
+            p.self_distance = c.self_distance_min
+            p.pin_group = s.vertex_group_mass
+            p.gravity_influence = s.effector_weights.gravity
+            p.frame_start, p.frame_end = mod.point_cache.frame_start, mod.point_cache.frame_end
+            p.settle_frames = 0
+            p.legacy_fit = True
+        p.setup_id = uuid.uuid4().hex
+        p.data_version = 1
+    elif any(o != obj and o.type == 'MESH' and o.quick_cloth.setup_id == p.setup_id
+             for o in bpy.data.objects):
+        p.setup_id = uuid.uuid4().hex
+        p.cage = p.wind = p.turbulence = None
+        p.animator_state = ''
+    return p
+
+
+class QC_OT_adopt(Operator):
+    """Adopt existing cloth without changing its modifier or baked result"""
+    bl_idname = 'quick_cloth.adopt'
+    bl_label = 'Adopt Existing Cloth'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return bool(obj and obj.type == 'MESH' and not obj.quick_cloth.setup_id
+                    and find_cloth_modifier(obj))
+
+    def execute(self, context):
+        try:
+            initialize_setup(context.active_object, context.scene, adopt=True)
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, 'Existing cloth adopted; live settings and cache preserved')
+        return {'FINISHED'}
 
 
 OVERRIDE_MESSAGE = ("This object is a linked override — make the cloth "
@@ -1014,8 +1111,12 @@ Idempotent — run it as often as you like"""
 
     def execute(self, context):
         scene = context.scene
-        props = scene.quick_cloth
         obj = context.active_object
+        try:
+            props = initialize_setup(obj, scene)
+        except ValueError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
 
         if object_is_override_locked(obj):
             self.report({'ERROR'}, OVERRIDE_MESSAGE)
@@ -1296,7 +1397,7 @@ Cache setting). Flip Quality Mode to Final first"""
         obj = context.active_object
         mod = find_cloth_modifier(obj)
         cache = mod.point_cache
-        cache.use_disk_cache = context.scene.quick_cloth.use_disk_cache
+        cache.use_disk_cache = get_props(context).use_disk_cache
         if cache.use_disk_cache:
             cache.use_library_path = True
         # ptcache is version-fragile → guarded temp_override, per
@@ -1458,7 +1559,7 @@ Animate freely, then Exit Animator Mode when the performance is locked"""
         return garment is not None and not animator_mode_active(obj)
 
     def execute(self, context):
-        props = context.scene.quick_cloth
+        props = get_props(context)
         garment, _cage = resolve_animator_pair(context.active_object)
 
         if object_is_override_locked(garment):
@@ -1552,8 +1653,10 @@ class QC_PT_panel(Panel):
 
     def draw(self, context):
         layout = self.layout
-        props = context.scene.quick_cloth
+        props = get_props(context)
         obj = context.active_object
+        if obj and obj.type == 'MESH' and not props.setup_id and find_cloth_modifier(obj):
+            layout.operator('quick_cloth.adopt', icon='IMPORT')
 
         # 1. Preset dropdown — top, full width.
         layout.prop(props, "preset", text="")
@@ -1675,6 +1778,7 @@ class QC_PT_panel(Panel):
 
 classes = (
     QuickClothProps,
+    QC_OT_adopt,
     QC_OT_simulate,
     QC_OT_set_pin_group,
     QC_OT_pin_from_rig_weights,
@@ -1699,6 +1803,7 @@ def register():
             bpy.utils.register_class(cls)
             _registered.append(cls)
         bpy.types.Scene.quick_cloth = PointerProperty(type=QuickClothProps)
+        bpy.types.Object.quick_cloth = PointerProperty(type=QuickClothProps)
     except Exception:
         unregister()
         raise
@@ -1707,6 +1812,8 @@ def register():
 def unregister():
     if hasattr(bpy.types.Scene, "quick_cloth"):
         del bpy.types.Scene.quick_cloth
+    if hasattr(bpy.types.Object, 'quick_cloth'):
+        del bpy.types.Object.quick_cloth
     for cls in reversed(_registered):
         bpy.utils.unregister_class(cls)
     _registered.clear()
