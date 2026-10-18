@@ -52,6 +52,7 @@ from bpy.props import (
 )
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector
+from .validation import geometry_issues, pin_coverage, validate_pin_edit
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -348,6 +349,8 @@ class QuickClothProps(PropertyGroup):
     turbulence: PointerProperty(type=bpy.types.Object)
     animator_state: StringProperty()
     legacy_fit: BoolProperty(default=False)
+    dynamic_mesh: BoolProperty(name='Dynamic Rest Shape', default=False,
+                              description='Recompute rest shape for squash/stretch rigs; not required for normal pinned cloth')
 
     preset: EnumProperty(
         name="Fabric Preset",
@@ -452,12 +455,12 @@ class QuickClothProps(PropertyGroup):
     # --- Garment ------------------------------------------------------------
     pin_stiffness: FloatProperty(
         name="Pin Stiffness",
-        description="How rigidly pinned vertices hold to their animated "
-                    "position. 1.0 = welded; lower values let pins lag and "
+        description="Target stiffness for weighted attachment vertices. Higher values resist lag; "
+                    "weights and solver quality also affect attachment. Pinned vertices "
                     "stretch. Pinned vertices follow the object's own "
                     "animation — animate or rig the object to drag a cape "
                     "around",
-        default=1.0, min=0.0, max=1.0, subtype='FACTOR',
+        default=1.0, min=0.0, max=50.0,
     )
     fit_tightness: FloatProperty(
         name="Fit Tightness",
@@ -656,10 +659,10 @@ def find_pin_group(obj):
     Same matcher pattern as Quick Break's find_impact_group."""
     if obj is None or obj.type != 'MESH':
         return None
-    for group in obj.vertex_groups:
-        if _normalize(group.name) in PIN_GROUP_ALIASES:
-            return group
-    return None
+    if obj.quick_cloth.pin_group:
+        return obj.vertex_groups.get(obj.quick_cloth.pin_group)
+    matches = [g for g in obj.vertex_groups if _normalize(g.name) in PIN_GROUP_ALIASES]
+    return matches[0] if len(matches) == 1 else None
 
 
 def find_cloth_modifier(obj):
@@ -684,7 +687,7 @@ def ensure_stack_order(obj, report=None):
     Uses modifiers.move() — no ops. Returns True if the stack was fixed."""
     arm_index = cloth_index = None
     for i, mod in enumerate(obj.modifiers):
-        if mod.type == 'ARMATURE' and arm_index is None:
+        if mod.type == 'ARMATURE':
             arm_index = i
         elif mod.type == 'CLOTH':
             cloth_index = i
@@ -745,6 +748,7 @@ def configure_cloth_from_props(mod, props, preview=False):
 
     # Pinning
     s.pin_stiffness = props.pin_stiffness
+    s.use_dynamic_mesh = props.dynamic_mesh
 
     # Quality — Preview halves steps (min 3) and collision quality (min 2)
     # and drops self-collision unless the preset mandates it (LATEX).
@@ -1112,6 +1116,12 @@ Idempotent — run it as often as you like"""
     def execute(self, context):
         scene = context.scene
         obj = context.active_object
+        errors, warnings = geometry_issues(obj)
+        if errors:
+            self.report({'ERROR'}, '; '.join(errors))
+            return {'CANCELLED'}
+        for warning in warnings:
+            self.report({'WARNING'}, warning)
         try:
             props = initialize_setup(obj, scene)
         except ValueError as exc:
@@ -1147,7 +1157,11 @@ Idempotent — run it as often as you like"""
         # 3. Pinning: fuzzy-find the pin group and wire it up.
         pin_group = find_pin_group(obj)
         if pin_group is not None:
+            props.pin_group = pin_group.name
             mod.settings.vertex_group_mass = pin_group.name
+            pinned, total = pin_coverage(obj, pin_group.name)
+            if pinned == total:
+                self.report({'WARNING'}, 'All vertices have attachment weights; paint weights down where cloth should move freely')
             self.report({'INFO'}, f"Pin group '{pin_group.name}' found and "
                                   "wired to the cloth")
         else:
@@ -1216,36 +1230,32 @@ weight the collar/waistband and let everything else simulate"""
     def execute(self, context):
         obj = context.active_object
 
-        if object_is_override_locked(obj):
-            self.report({'ERROR'}, OVERRIDE_MESSAGE)
+        try:
+            validate_pin_edit(obj)
+        except ValueError as exc:
+            self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
 
-        # Flush the edit-mode selection to the mesh data by toggling to
-        # Object Mode (selection state is restored by returning to Edit
-        # Mode below — we never leave the user somewhere else).
-        bpy.ops.object.mode_set(mode='OBJECT')
-        selected = [v.index for v in obj.data.vertices if v.select]
-
+        # BMesh edits keep the user's mode/selection intact, including failures.
+        import bmesh
+        bm = bmesh.from_edit_mesh(obj.data)
+        selected = [v for v in bm.verts if v.select]
         if not selected:
-            bpy.ops.object.mode_set(mode='EDIT')
-            self.report({'ERROR'},
-                        "Nothing selected — select the vertices to pin "
-                        "(collar, waistband, corners) in Edit Mode first")
+            self.report({'ERROR'}, 'Select vertices to pin first')
             return {'CANCELLED'}
-
-        group = find_pin_group(obj)
+        name = obj.quick_cloth.pin_group
+        group = obj.vertex_groups.get(name) if name else None
         if group is None:
-            group = obj.vertex_groups.new(name=PIN_GROUP_CANONICAL)
-        else:
-            # Refresh: clear old weights so the group exactly matches the
-            # new selection.
-            group.remove(list(range(len(obj.data.vertices))))
-        group.add(selected, 1.0, 'REPLACE')
-
-        bpy.ops.object.mode_set(mode='EDIT')
-        self.report({'INFO'},
-                    f"Pin group '{group.name}' set from {len(selected)} "
-                    "selected vertice(s)")
+            group = obj.vertex_groups.new(name='QC Attachment')
+        layer = bm.verts.layers.deform.verify()
+        for v in bm.verts:
+            if group.index in v[layer]:
+                del v[layer][group.index]
+        for v in selected:
+            v[layer][group.index] = 1.0
+        obj.quick_cloth.pin_group = group.name
+        bmesh.update_edit_mesh(obj.data)
+        self.report({'INFO'}, f'Updated {group.name}: {len(selected)} attachment vertices')
         return {'FINISHED'}
 
 
@@ -1270,6 +1280,16 @@ Set Pin Group untouched for manual selections"""
     def execute(self, context):
         obj = context.active_object
 
+        try:
+            validate_pin_edit(obj)
+        except ValueError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        rigs = [m for m in obj.modifiers if m.type == 'ARMATURE' and m.object]
+        if len(rigs) != 1 or not rigs[0].use_vertex_groups:
+            self.report({'ERROR'}, 'Automatic pinning requires one vertex-weight armature; choose an attachment group manually for other rigs')
+            return {'CANCELLED'}
+
         if object_is_override_locked(obj):
             self.report({'ERROR'}, OVERRIDE_MESSAGE)
             return {'CANCELLED'}
@@ -1293,9 +1313,10 @@ Set Pin Group untouched for manual selections"""
         # Sum each vertex's bone weights, clamped to 0–1. Reading weights
         # via vertex.groups is direct data access — no ops, no mode
         # switches, selection untouched.
-        pin_group = find_pin_group(obj)
+        pin_group = obj.vertex_groups.get(obj.quick_cloth.pin_group)
         if pin_group is None:
-            pin_group = obj.vertex_groups.new(name=PIN_GROUP_CANONICAL)
+            pin_group = obj.vertex_groups.new(name='QC Attachment')
+        obj.quick_cloth.pin_group = pin_group.name
         pin_index = pin_group.index
 
         weighted = 0
@@ -1322,6 +1343,8 @@ Set Pin Group untouched for manual selections"""
                     f"Pin group '{pin_group.name}' built from rig weights "
                     f"({weighted}/{len(obj.data.vertices)} vertices). Paint "
                     "the pin weights DOWN where fabric should swing free")
+        if weighted == len(obj.data.vertices):
+            self.report({'WARNING'}, 'All vertices are weighted: paint attachment weights down to allow free cloth motion')
         return {'FINISHED'}
 
 
@@ -1698,6 +1721,11 @@ class QC_PT_panel(Panel):
         box.operator("quick_cloth.pin_from_rig_weights",
                      icon='ARMATURE_DATA')
         box.prop(props, "pin_stiffness")
+        if obj and obj.type == 'MESH':
+            box.prop_search(props, 'pin_group', obj, 'vertex_groups')
+            weighted, total = pin_coverage(obj, props.pin_group)
+            box.label(text=f'Attachment coverage: {weighted}/{total} vertices')
+        box.prop(props, 'dynamic_mesh')
         box.prop(props, "fit_tightness")
         row = box.row(align=True)
         row.prop(props, "use_sewing")
