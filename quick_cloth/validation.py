@@ -2,11 +2,19 @@
 import math
 
 
+def editable(data):
+    if data is None:
+        return False
+    override = getattr(data, 'override_library', None)
+    return (getattr(data, 'is_editable', data.library is None or override is not None)
+            and not (override and getattr(override, 'is_system_override', False)))
+
+
 def geometry_issues(obj, depsgraph=None):
     errors, warnings = [], []
     if obj is None or obj.type != 'MESH':
         return ['Select a mesh garment'], []
-    if not obj.is_editable or not obj.data.is_editable:
+    if not editable(obj) or not editable(obj.data):
         errors.append('Garment object and mesh must be editable')
     if abs(obj.matrix_world.determinant()) < 1e-12:
         errors.append('Garment has a singular transform (zero scale)')
@@ -33,9 +41,31 @@ def geometry_issues(obj, depsgraph=None):
             warnings.append('Envelope-only rig: choose attachment weights explicitly')
     if data.users > 1:
         warnings.append('Mesh data is shared; make it single-user before editing pin weights')
+    if len(obj.users_scene) > 1:
+        errors.append('Garment is shared across scenes; use a single-scene object copy for independent simulation')
     if len(data.vertices) > 100000:
         warnings.append('More than 100,000 simulation vertices: consider a lower-resolution proxy')
     return errors, warnings
+
+
+def contact_warnings(context, obj, body):
+    """Current evaluated pose only; not a continuous collision certificate."""
+    if not body or body.type != 'MESH':
+        return []
+    from mathutils.bvhtree import BVHTree
+    deps = context.evaluated_depsgraph_get()
+    source = obj.evaluated_get(deps)
+    target = body.evaluated_get(deps)
+    points = [target.matrix_world @ v.co for v in target.data.vertices]
+    faces = [tuple(f.vertices) for f in target.data.polygons]
+    if not points or not faces:
+        return [f'{body.name}: evaluated collider has no surface']
+    tree = BVHTree.FromPolygons(points, faces)
+    source_points = [source.matrix_world @ v.co for v in source.data.vertices]
+    source_tree = BVHTree.FromPolygons(source_points, [tuple(f.vertices) for f in source.data.polygons])
+    if source_tree.overlap(tree):
+        return ['Current evaluated cloth/body surfaces overlap; inspect intersections before delivery baking']
+    return []
 
 
 def pin_coverage(obj, name):
@@ -48,7 +78,7 @@ def pin_coverage(obj, name):
 
 
 def validate_pin_edit(obj):
-    if not obj.is_editable or not obj.data.is_editable:
+    if not editable(obj) or not editable(obj.data):
         raise ValueError('Object and mesh must be editable')
     if obj.data.users > 1:
         raise ValueError('Pin weights affect shared mesh data. Make the mesh single-user first.')

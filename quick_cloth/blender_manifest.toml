@@ -1,7 +1,7 @@
-schema_version = "1.0.3"
+schema_version = "1.0.0"
 
 id = "quick_cloth"
-version = "1.0.3"
+version = "1.1.0"
 name = "Quick Cloth"
 tagline = "One-click preset-driven cloth simulation for animators"
 maintainer = "Quick Physics Tools"
@@ -14,3 +14,9 @@ license = [
 ]
 
 tags = ["Object", "Physics"]
+
+[permissions]
+files = "Validate and store cloth caches beside the saved project"
+
+[build]
+paths = ["__init__.py", "validation.py", "quality.py", "baking.py", "blender_manifest.toml", "README.md", "docs/"]

@@ -1,33 +1,13 @@
-"""
-Quick Cloth — one-click, preset-driven cloth simulation for animators.
+"""Quick Cloth: per-garment setup, explicit cache rebuilds and native cloth baking.
 
-Sister addon to Quick Break. Wraps Blender's native cloth simulator in a
-single clean N-panel: pick a fabric preset, click "Simulate Cloth!", and get
-believable cloth — with every raw parameter still exposed for tweaking.
-
-Key design rules (shared with Quick Break):
-  * Presets are STARTING POINTS. Selecting one writes a full dictionary of
-    values into the PropertyGroup (and into a live cloth modifier if one
-    exists); every slider stays editable afterwards.
-  * NO collision collections are ever created or assigned. The cloth
-    modifier's collision collection stays None so the cloth interacts with
-    every collision object in the scene, each one independently.
-  * Point-cache hygiene is built in: the cache never starts on a frame the
-    timeline cannot reach, stale bakes are freed, and the playhead is
-    rewound so simulations never silently freeze.
-  * Idempotent everywhere: re-running the main operator reuses the existing
-    cloth modifier, wind rig, and colliders. Nothing stacks or duplicates.
-
-Blender 4.1+ (legacy addon) and 4.2+ (native Extension via manifest).
-NOTE on 4.4 slotted/layered actions: this addon never reads
-object.animation_data.action.fcurves directly; if that ever becomes
-necessary, wrap it in try/except (the data model changed in 4.4).
+Legacy Blender 4.1 and native extension packaging for 4.2+.
+See README.md and docs/RELEASE_STATUS.md for tested versions and limitations.
 """
 
 bl_info = {
     "name": "Quick Cloth",
     "author": "Quick Physics Tools",
-    "version": (1, 0, 3),
+    "version": (1, 1, 0),
     "blender": (4, 1, 0),
     "location": "3D Viewport > Sidebar (N) > Quick Cloth",
     "description": "One-click preset-driven cloth simulation for animators",
@@ -45,6 +25,7 @@ from datetime import datetime, timezone
 from . import baking
 from bpy.props import (
     BoolProperty,
+    CollectionProperty,
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
@@ -54,7 +35,7 @@ from bpy.props import (
 )
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector
-from .validation import geometry_issues, pin_coverage, validate_pin_edit, depends_on
+from .validation import geometry_issues, pin_coverage, validate_pin_edit, depends_on, editable, contact_warnings
 from .quality import resolve as resolve_quality, selection_update as quality_update, values_update as quality_values_update
 
 # ---------------------------------------------------------------------------
@@ -349,10 +330,16 @@ def wind_enabled_update(self, context):
             obj.field.strength = strength if self.use_wind else 0
 
 
+class QCSetupRef(PropertyGroup):
+    uid: StringProperty()
+    owner: PointerProperty(type=bpy.types.Object)
+
+
 class QuickClothProps(PropertyGroup):
     """Per-garment settings; Scene settings are defaults for new setups only."""
 
     setup_id: StringProperty()
+    owner: PointerProperty(type=bpy.types.Object)
     data_version: IntProperty(default=0)
     pin_group: StringProperty(name="Attachment Group")
     cage: PointerProperty(type=bpy.types.Object)
@@ -375,6 +362,8 @@ class QuickClothProps(PropertyGroup):
                           poll=lambda self, obj: obj.type == 'MESH')
     binding_name: StringProperty()
     binding_target: PointerProperty(type=bpy.types.Object)
+    diagnostics: StringProperty()
+    coverage_text: StringProperty(default='Not inspected')
     collider_thickness: FloatProperty(name='New Collider Thickness', default=.005, min=.001, max=1, unit='LENGTH')
     impulse_clamp: FloatProperty(name='Collision Impulse Clamp', default=0, min=0, max=10000)
     self_impulse_clamp: FloatProperty(name='Self Impulse Clamp', default=0, min=0, max=10000)
@@ -724,8 +713,8 @@ def ensure_stack_order(obj, report=None):
 def configure_cloth_from_props(mod, props, preview=False):
     """Write the PropertyGroup values into a Cloth modifier.
 
-    `preview` applies the Preview/Final scaling NON-destructively: it scales
-    values at configure time and never overwrites the stored sliders.
+    The legacy preview argument is retained for API compatibility. Quality is
+    always resolved from the garment's selected tier.
     """
     s = mod.settings
     c = mod.collision_settings
@@ -759,7 +748,6 @@ def configure_cloth_from_props(mod, props, preview=False):
     # Internal springs (Couch Leather volume)
     s.use_internal_springs = props.use_internal_springs
     if props.use_internal_springs:
-        s.internal_spring_max_length = 0.0
         s.internal_tension_stiffness = props.internal_stiffness
         s.internal_compression_stiffness = props.internal_stiffness
 
@@ -778,17 +766,10 @@ def configure_cloth_from_props(mod, props, preview=False):
     c.self_distance_min = props.self_distance
     c.use_collision = props.use_object_collision
 
-    # Anti-jitter: cap collision repulsion impulses. Unclamped impulses are
-    # the main source of at-rest micro-jitter when self-collision or tight
-    # collision distances are active (0 = unclamped in Blender, so we set a
-    # finite ceiling).
+    # Authored clamping values; no universal anti-jitter claim.
     c.impulse_clamp = props.impulse_clamp
     c.self_impulse_clamp = props.self_impulse_clamp
 
-    # CRITICAL: no collision collection, ever. Leaving it None makes the
-    # cloth interact with EVERY collision object in the scene, each one
-    # independently. (The word "collection" appears here only to document
-    # that none is used.)
     # Existing user collision filters remain intact. New Cloth uses its native default.
 
 
@@ -837,12 +818,24 @@ def make_collider(obj, thickness=.005):
 
 
 def owned_helper(obj, props):
-    return bool(obj and obj.get('qc_owner') == props.setup_id and props.setup_id)
+    return bool(obj and obj.get('qc_owner') == props.setup_id and props.setup_id
+                and obj.quick_cloth.garment == props.id_data)
 
 
 def ensure_wind_rig(context, props):
     if not props.setup_id:
         raise ValueError('Set up the garment before adding wind')
+    direction = Vector(props.wind_direction)
+    if props.use_wind and direction.length < 1e-6:
+        raise ValueError('Wind direction cannot be zero')
+    for obj, kind in ((props.wind, 'WIND'), (props.turbulence, 'TURBULENCE')):
+        if owned_helper(obj, props) and (obj.field is None or obj.field.type != kind):
+            raise ValueError(f'{obj.name}: owned force field was changed; remove and recreate it')
+    if owned_helper(props.wind, props) and (props.wind.parent or props.wind.constraints):
+        raise ValueError('Owned wind has a parent/constraint; remove it before using world-space direction')
+    if not props.use_wind:
+        wind_enabled_update(props, context)
+        return props.wind
     selected = list(context.selected_objects)
     active = context.view_layer.objects.active
     try:
@@ -854,6 +847,7 @@ def ensure_wind_rig(context, props):
                 obj = context.object
                 obj.name = label
                 obj['qc_owner'] = props.setup_id
+                obj.quick_cloth.garment = props.id_data
                 setattr(props, attr, obj)
             if obj.field is None or obj.field.type != kind:
                 raise ValueError(f'{obj.name}: owned force field was changed; remove and recreate it')
@@ -904,8 +898,7 @@ def cache_hygiene(context, scene, cache, sim_start, sim_end, report=None):
 
 def object_is_override_locked(obj):
     """True for linked or library-override data we must not edit."""
-    return (obj is None or not obj.is_editable
-            or (obj.override_library is not None and obj.override_library.is_system_override))
+    return not editable(obj)
 
 
 def get_props(context):
@@ -925,12 +918,34 @@ def initialize_setup(obj, scene, adopt=False):
     if not p.setup_id:
         if mod is not None and not adopt:
             raise ValueError('Existing cloth found. Use Adopt Existing Cloth to preserve its settings.')
+        if mod is not None:
+            # Reject lossy adoption before touching ANY authored properties.
+            native = {prop.identifier: getattr(mod.settings, prop.identifier)
+                      for prop in p.bl_rna.properties
+                      if hasattr(mod.settings, prop.identifier)
+                      and prop.type in {'INT', 'FLOAT'} and not prop.is_array}
+            native.update(fit_tightness=mod.settings.shrink_min,
+                          quality_steps=mod.settings.quality,
+                          collision_quality=mod.collision_settings.collision_quality,
+                          object_distance=mod.collision_settings.distance_min,
+                          self_distance=mod.collision_settings.self_distance_min,
+                          pressure_force=mod.settings.uniform_pressure_force,
+                          sewing_force=mod.settings.sewing_force_max,
+                          internal_stiffness=mod.settings.internal_tension_stiffness)
+            for key, value in native.items():
+                limits = p.bl_rna.properties[key]
+                if not limits.hard_min <= value <= limits.hard_max:
+                    raise ValueError(f'Cannot adopt {key}={value:g} without loss; supported panel range '
+                                     f'is {limits.hard_min:g}–{limits.hard_max:g}. Original cloth is unchanged.')
         # New setups use scene defaults; adoption reads the live modifier below.
         excluded = {'rna_type', 'setup_id', 'data_version', 'cage', 'garment', 'wind',
-                    'turbulence', 'animator_state', 'legacy_fit', 'preset'}
+                    'turbulence', 'animator_state', 'legacy_fit', 'preset',
+                    'bake_state', 'bake_error', 'bake_signature', 'bake_metadata', 'bake_needs_validation',
+                    'binding_name', 'binding_target', 'quality_steps', 'collision_quality', 'diagnostics', 'coverage_text'}
         for prop in p.bl_rna.properties:
             key = prop.identifier
-            if key not in excluded and not prop.is_readonly and prop.type != 'POINTER' and not p.is_property_set(key):
+            if (key not in excluded and not prop.is_readonly and prop.type != 'POINTER'
+                    and not p.is_property_set(key) and scene.quick_cloth.is_property_set(key)):
                 setattr(p, key, getattr(scene.quick_cloth, key))
         # Avoid firing the fabric callback during migration.
         if not p.is_property_set('preset'):
@@ -963,13 +978,23 @@ def initialize_setup(obj, scene, adopt=False):
             p.quality_mode = 'CUSTOM'
             p.quality_steps = s.quality
             p.collision_quality = c.collision_quality
+            p.dynamic_mesh = s.use_dynamic_mesh
+            if not s.use_pressure_volume:
+                p.pressure_target_volume = 0
+            p.bake_needs_validation = mod.point_cache.is_baked
         p.setup_id = uuid.uuid4().hex
         p.data_version = 1
-    elif any(o != obj and o.type == 'MESH' and o.quick_cloth.setup_id == p.setup_id
-             for o in bpy.data.objects):
+    elif any(entry.uid == p.setup_id and entry.owner != obj and entry.owner is not None
+             for entry in scene.quick_cloth_registry):
         p.setup_id = uuid.uuid4().hex
         p.cage = p.wind = p.turbulence = None
         p.animator_state = ''
+        p.bake_signature = p.bake_metadata = ''
+        p.bake_needs_validation = True
+    p.owner = obj
+    if not any(entry.uid == p.setup_id and entry.owner == obj for entry in scene.quick_cloth_registry):
+        entry = scene.quick_cloth_registry.add()
+        entry.uid, entry.owner = p.setup_id, obj
     return p
 
 
@@ -982,6 +1007,9 @@ class QC_OT_quality(Operator):
     def execute(self, context):
         if self.tier not in {'PREVIEW', 'MEDIUM', 'HIGH', 'CUSTOM'}:
             return {'CANCELLED'}
+        if baking.any_baking():
+            self.report({'ERROR'}, 'Wait for the running bake before changing quality')
+            return {'CANCELLED'}
         get_props(context).quality_mode = self.tier
         return {'FINISHED'}
 
@@ -989,14 +1017,16 @@ class QC_OT_quality(Operator):
 class QC_OT_adopt(Operator):
     """Adopt existing cloth without changing its modifier or baked result"""
     bl_idname = 'quick_cloth.adopt'
-    bl_label = 'Adopt Existing Cloth'
+    bl_label = 'Adopt Cloth / Initialize Copy'
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return bool(obj and obj.type == 'MESH' and not obj.quick_cloth.setup_id
-                    and find_cloth_modifier(obj))
+        return bool(obj and obj.type == 'MESH' and find_cloth_modifier(obj)
+                    and (not obj.quick_cloth.setup_id or not any(
+                        e.uid == obj.quick_cloth.setup_id and e.owner == obj
+                        for e in context.scene.quick_cloth_registry)))
 
     def execute(self, context):
         try:
@@ -1082,8 +1112,8 @@ class QC_OT_simulate(Operator):
     """Set up (or refresh) the cloth simulation on the active mesh:
 configure the Cloth modifier from the panel values, fix the Armature/Cloth
 stack order, auto-convert rigid-body obstacles into colliders, build the
-wind rig, and run cache hygiene so the sim can never silently freeze.
-Idempotent — run it as often as you like"""
+owned wind rig, and validate the exact simulation range.
+Existing baked caches require explicit Rebuild Bake"""
     bl_idname = "quick_cloth.simulate"
     bl_label = "Simulate Cloth!"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1153,6 +1183,7 @@ Idempotent — run it as often as you like"""
             props.pin_group = pin_group.name
             mod.settings.vertex_group_mass = pin_group.name
             pinned, total = pin_coverage(obj, pin_group.name)
+            props.coverage_text = f'{pinned}/{total} vertices (last setup check)'
             if pinned == total:
                 self.report({'WARNING'}, 'All vertices have attachment weights; paint weights down where cloth should move freely')
             self.report({'INFO'}, f"Pin group '{pin_group.name}' found and "
@@ -1174,7 +1205,7 @@ Idempotent — run it as often as you like"""
                             f"Gave {n} rigid-body obstacle(s) a Collision "
                             "modifier")
 
-        # 6. Wind rig (found by name — idempotent).
+        # 6. Owned wind pointers; names do not grant ownership.
         if props.use_wind or props.wind:
             try:
                 ensure_wind_rig(context, props)
@@ -1244,6 +1275,7 @@ weight the collar/waistband and let everything else simulate"""
         for v in selected:
             v[layer][group.index] = 1.0
         obj.quick_cloth.pin_group = group.name
+        obj.quick_cloth.coverage_text = f'{len(selected)}/{len(bm.verts)} vertices (last pin edit)'
         bmesh.update_edit_mesh(obj.data)
         self.report({'INFO'}, f'Updated {group.name}: {len(selected)} attachment vertices')
         return {'FINISHED'}
@@ -1335,6 +1367,7 @@ Set Pin Group untouched for manual selections"""
                     "the pin weights DOWN where fabric should swing free")
         if weighted == len(obj.data.vertices):
             self.report({'WARNING'}, 'All vertices are weighted: paint attachment weights down to allow free cloth motion')
+        obj.quick_cloth.coverage_text = f'{weighted}/{len(obj.data.vertices)} vertices (last pin edit)'
         return {'FINISHED'}
 
 
@@ -1412,6 +1445,24 @@ class QC_OT_remove_wind(Operator):
         return {'FINISHED'}
 
 
+class QC_OT_diagnose(Operator):
+    bl_idname = 'quick_cloth.diagnose'
+    bl_label = 'Inspect Setup / Current Contact'
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            return {'CANCELLED'}
+        errors, warnings = baking.preflight(context, obj, storage=True)
+        warnings += contact_warnings(context, obj, obj.quick_cloth.body)
+        weighted, total = pin_coverage(obj, obj.quick_cloth.pin_group)
+        obj.quick_cloth.coverage_text = f'{weighted}/{total} vertices (last inspection)'
+        messages = errors + warnings
+        obj.quick_cloth.diagnostics = '\n'.join(messages) or 'Preflight passed. Full-shot visual collision acceptance is still required.'
+        self.report({'WARNING'} if messages else {'INFO'}, obj.quick_cloth.diagnostics)
+        return {'FINISHED'}
+
+
 class QC_OT_validate_bake(Operator):
     bl_idname = 'quick_cloth.validate_bake'
     bl_label = 'Validate Cache Dependencies'
@@ -1475,6 +1526,10 @@ class QC_OT_bake(Operator):
             configure_cloth_from_props(mod, p)
             ensure_stack_order(obj)
             mod.settings.vertex_group_mass = p.pin_group
+            if p.use_collision_objects:
+                convert_obstacles_to_colliders(context.scene, obj, p.collider_thickness, report=self.report)
+            if p.use_wind or p.wind:
+                ensure_wind_rig(context, p)
             start, end = baking.effective_range(context.scene, p)
             cache_hygiene(context, context.scene, mod.point_cache, start, end)
             mod.point_cache.use_disk_cache = p.use_disk_cache
@@ -1490,6 +1545,8 @@ class QC_OT_bake(Operator):
                 self._scene.frame_set(self._frame)
                 self.report({'WARNING'}, 'Bake cancelled; no complete cache recorded')
                 return {'CANCELLED'}
+            if result not in ({'FINISHED'}, {'RUNNING_MODAL'}):
+                raise RuntimeError(f'Unexpected native bake status: {result}')
             if getattr(self, '_interactive', False) and not bpy.app.background:
                 self._timer = context.window_manager.event_timer_add(.5, window=context.window)
                 context.window_manager.modal_handler_add(self)
@@ -1509,7 +1566,13 @@ class QC_OT_bake(Operator):
                 return {'CANCELLED'}
             if not find_cloth_modifier(self._obj).point_cache.is_baking and self._ticks > 2:
                 self.cleanup(context)
-                return self.finish(context)
+                try:
+                    return self.finish(context)
+                except Exception as exc:
+                    self._obj.quick_cloth.bake_state = 'FAILED'
+                    self._obj.quick_cloth.bake_error = str(exc)
+                    self.report({'ERROR'}, f'Bake completion validation failed: {exc}')
+                    return {'CANCELLED'}
             for area in context.screen.areas:
                 area.tag_redraw()
         # Pass Escape through to Blender's native point-cache job.
@@ -1564,7 +1627,7 @@ class QC_OT_apply_as_shape(Operator):
     """Snapshot the cloth at the current frame as a NEW object — extract a
 nicely draped couch cushion or hung coat without destroying the sim setup"""
     bl_idname = "quick_cloth.apply_as_shape"
-    bl_label = "Apply as Shape"
+    bl_label = "Create Static Snapshot"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1754,7 +1817,13 @@ class QC_OT_exit_animator_mode(Operator):
             self.report({'ERROR'}, 'Include the garment collection in this view layer before recovery')
             return {'CANCELLED'}
         p = garment.quick_cloth
-        state = json.loads(p.animator_state)
+        try:
+            state = json.loads(p.animator_state)
+            if not isinstance(state, dict) or not {'hidden', 'hide_viewport', 'cloth_viewport'} <= state.keys():
+                raise ValueError('missing visibility fields')
+        except (ValueError, TypeError) as exc:
+            self.report({'ERROR'}, f'Saved Animator Mode state is damaged; restore garment visibility manually: {exc}')
+            return {'CANCELLED'}
         garment.hide_viewport = state['hide_viewport']
         garment.hide_set(state['hidden'])
         mod = find_cloth_modifier(garment)
@@ -1790,7 +1859,7 @@ class QC_PT_panel(Panel):
         layout.enabled = not baking.any_baking()
         props = get_props(context)
         obj = context.active_object
-        if obj and obj.type == 'MESH' and not props.setup_id and find_cloth_modifier(obj):
+        if QC_OT_adopt.poll(context):
             layout.operator('quick_cloth.adopt', icon='IMPORT')
 
         # 1. Preset dropdown — top, full width.
@@ -1835,8 +1904,7 @@ class QC_PT_panel(Panel):
         box.prop(props, "pin_stiffness")
         if obj and obj.type == 'MESH':
             box.prop_search(props, 'pin_group', obj, 'vertex_groups')
-            weighted, total = pin_coverage(obj, props.pin_group)
-            box.label(text=f'Attachment coverage: {weighted}/{total} vertices')
+            box.label(text=f'Attachment coverage: {props.coverage_text}')
         box.prop(props, 'dynamic_mesh')
         box.prop(props, "fit_tightness")
         if props.legacy_fit:
@@ -1876,6 +1944,11 @@ class QC_PT_panel(Panel):
         box.prop(props, "object_distance")
         box.prop(props, 'impulse_clamp')
         box.prop(props, 'self_impulse_clamp')
+        box.operator('quick_cloth.diagnose', icon='VIEWZOOM')
+        for message in props.diagnostics.splitlines():
+            box.label(text=message, icon='INFO')
+        colliders = [o for o in context.scene.objects if o != obj and any(m.type == 'COLLISION' and m.show_viewport for m in o.modifiers)]
+        box.label(text=f'{len(colliders)} enabled scene collider(s); existing filters preserved')
         row = box.row(align=True)
         row.prop(props, "use_self_collision")
         sub = row.row()
@@ -1956,6 +2029,7 @@ class QC_PT_panel(Panel):
 # ---------------------------------------------------------------------------
 
 classes = (
+    QCSetupRef,
     QuickClothProps,
     QC_OT_adopt,
     QC_OT_quality,
@@ -1967,6 +2041,7 @@ classes = (
     QC_OT_remove_wind,
     QC_OT_bake,
     QC_OT_validate_bake,
+    QC_OT_diagnose,
     QC_OT_free_bake,
     QC_OT_apply_as_shape,
     QC_OT_bind_render_mesh,
@@ -1980,12 +2055,15 @@ _registered = []
 
 
 def register():
+    if _registered:
+        return
     try:
         for cls in classes:
             bpy.utils.register_class(cls)
             _registered.append(cls)
         bpy.types.Scene.quick_cloth = PointerProperty(type=QuickClothProps)
         bpy.types.Object.quick_cloth = PointerProperty(type=QuickClothProps)
+        bpy.types.Scene.quick_cloth_registry = CollectionProperty(type=QCSetupRef)
         bpy.app.handlers.load_post.append(baking.on_load)
         bpy.app.handlers.depsgraph_update_post.append(baking.on_update)
     except Exception:
@@ -2000,6 +2078,8 @@ def unregister():
             handlers.remove(callback)
     if hasattr(bpy.types.Scene, "quick_cloth"):
         del bpy.types.Scene.quick_cloth
+    if hasattr(bpy.types.Scene, 'quick_cloth_registry'):
+        del bpy.types.Scene.quick_cloth_registry
     if hasattr(bpy.types.Object, 'quick_cloth'):
         del bpy.types.Object.quick_cloth
     for cls in reversed(_registered):

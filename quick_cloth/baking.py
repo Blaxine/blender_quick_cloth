@@ -1,13 +1,11 @@
 """Bake validation and reproducibility metadata for native cloth caches."""
 import hashlib
 import json
-import math
-import os
 from pathlib import Path
 import shutil
 import tempfile
 import bpy
-from .validation import geometry_issues, pin_coverage
+from .validation import geometry_issues, pin_coverage, editable
 
 
 def cloth(obj):
@@ -58,20 +56,27 @@ def check_storage(obj, start, end):
 
 
 def preflight(context, obj, storage=False):
-    errors, warnings = geometry_issues(obj)
+    # Poll/draw must remain cheap on production meshes; full checks run in execute.
+    errors, warnings = (geometry_issues(obj) if storage else ([], []))
     if obj is None or obj.type != 'MESH':
-        return errors, warnings
+        return ['Select a mesh garment'], warnings
+    if not editable(obj) or not editable(obj.data):
+        errors.append('Garment object and mesh must be editable')
     p, mod = obj.quick_cloth, cloth(obj)
     if context.mode != 'OBJECT':
         errors.append('Return to Object Mode before baking')
     if not p.setup_id or p.garment:
         errors.append('Select a configured garment, not an animation cage')
+    if p.owner != obj or not any(e.uid == p.setup_id and e.owner == obj for e in context.scene.quick_cloth_registry):
+        errors.append('Duplicated/uninitialized setup identity: run Simulate Cloth to initialize this garment')
     if len(obj.users_scene) > 1:
         errors.append('Garment is shared between scenes; make a single-scene object copy before baking')
     if mod is None:
         errors.append('Set Up Cloth before baking')
     elif not mod.show_viewport or not mod.show_render or p.animator_state:
         errors.append('Exit Animator Mode and enable the Cloth modifier in viewport and render')
+    if mod and mod.point_cache.use_external:
+        errors.append('External/imported caches are not managed by Quick Cloth; choose a native internal cache explicitly first')
     if obj.name not in context.view_layer.objects or obj.hide_get() or obj.hide_viewport:
         errors.append('Garment must be visible in the active view layer')
     if any_baking():
@@ -84,16 +89,22 @@ def preflight(context, obj, storage=False):
         errors.append(str(exc))
     if p.pin_group and not obj.vertex_groups.get(p.pin_group):
         errors.append(f'Attachment group is missing: {p.pin_group}')
-    pinned, total = pin_coverage(obj, p.pin_group)
-    if total and pinned == total:
-        warnings.append('Every vertex has attachment weights; cloth may follow the rig rigidly')
+    if storage:
+        pinned, total = pin_coverage(obj, p.pin_group)
+        if total and pinned == total:
+            warnings.append('Every vertex has attachment weights; cloth may follow the rig rigidly')
     if p.body:
         collider = next((m for m in p.body.modifiers if m.type == 'COLLISION'), None)
         if not collider or not collider.show_viewport or not p.body.collision.use:
             warnings.append(f'{p.body.name}: intended body has no enabled collision')
         elif any(m.type == 'ARMATURE' for m in list(p.body.modifiers)[list(p.body.modifiers).index(collider)+1:]):
             errors.append(f'{p.body.name}: move Collision after Armature deformation')
-    if p.use_pressure:
+    if p.use_wind:
+        if sum(v*v for v in p.wind_direction) < 1e-12:
+            errors.append('Wind direction cannot be zero')
+        if p.wind and (p.wind.parent or p.wind.constraints):
+            errors.append('Owned wind has a parent/constraint; remove it before using world-space direction')
+    if p.use_pressure and storage:
         import bmesh
         bm = bmesh.new()
         try:
@@ -102,12 +113,16 @@ def preflight(context, obj, storage=False):
                 warnings.append('Pressure on open/nonmanifold geometry requires careful volume validation')
         finally:
             bm.free()
-    if p.use_sewing and not any(e.is_loose for e in obj.data.edges):
+    if storage and p.use_sewing and not any(e.is_loose for e in obj.data.edges):
         warnings.append('Sewing enabled but no loose seam edges exist')
     return errors, warnings
 
 
 def free(context, obj):
+    if not editable(obj) or not obj.quick_cloth.setup_id:
+        raise ValueError('Select an editable, adopted garment before freeing its cache')
+    if not any(e.uid == obj.quick_cloth.setup_id and e.owner == obj for e in context.scene.quick_cloth_registry):
+        raise ValueError('Initialize the duplicated setup before managing its cache')
     mod = cloth(obj)
     if not mod:
         raise ValueError('No cloth cache on target')
@@ -133,13 +148,14 @@ def action_data(animation):
             for strip in layer.strips:
                 for bag in getattr(strip, 'channelbags', ()):
                     curves.extend(bag.fcurves)
-        return [action.name, [(f.data_path, f.array_index,
-                 [(tuple(k.co), tuple(k.handle_left), tuple(k.handle_right), k.interpolation) for k in f.keyframe_points])
+        return [action.name, [(f.data_path, f.array_index, f.mute, f.extrapolation,
+                 [(tuple(k.co), tuple(k.handle_left), tuple(k.handle_right), k.interpolation, k.easing) for k in f.keyframe_points],
+                 [rna_values(m) for m in f.modifiers], [tuple(k.co) for k in f.sampled_points])
                 for f in curves]]
     return [action(animation.action),
             [(t.mute, [(s.name, s.frame_start, s.frame_end, s.scale, s.repeat, s.influence, s.blend_type, action(s.action))
                        for s in t.strips]) for t in animation.nla_tracks],
-            [(d.data_path, d.driver.expression, [(v.name, [(t.id.name if t.id else '', t.data_path) for t in v.targets])
+            [(d.data_path, d.driver.type, d.driver.expression, [rna_values(m) for m in d.modifiers], [(v.name, v.type, [(t.id.name if t.id else '', t.data_path) for t in v.targets])
                                                for v in d.driver.variables]) for d in animation.drivers]]
 
 
@@ -166,13 +182,16 @@ def signature(scene, obj):
     """Conservative scene signature. External driver inputs need explicit validation."""
     p = obj.quick_cloth
     excluded = {'bake_signature', 'bake_state', 'bake_error', 'bake_metadata', 'bake_needs_validation',
-                'animator_state', 'cage', 'garment', 'show_fabric_detail', 'custom_steps', 'custom_collision'}
+                'animator_state', 'cage', 'garment', 'show_fabric_detail', 'custom_steps', 'custom_collision', 'diagnostics', 'coverage_text'}
     state = [bpy.app.version_string, rna_values(p, excluded),
              (scene.render.fps, scene.render.fps_base, tuple(scene.gravity), scene.use_gravity, scene.unit_settings.scale_length)]
+    state.append({k: scene[k] for k in scene.keys() if k not in {'quick_cloth', 'quick_cloth_registry'}})
     for item in sorted(scene.objects, key=lambda o: o.name):
         if item.get('qc_helper') == 'cage':
             continue
         data = [item.name, item.type, item.parent.name if item.parent else None,
+                sorted(c.name for c in item.users_collection),
+                {k: item[k] for k in item.keys() if k != 'quick_cloth' and not k.startswith('qc_')},
                 action_data(item.animation_data), [rna_values(c) for c in item.constraints]]
         if not item.animation_data:
             data.append([list(row) for row in item.matrix_basis])
@@ -185,6 +204,7 @@ def signature(scene, obj):
                 data.append([(k.name, k.value, [tuple(v.co) for v in k.data]) for k in item.data.shape_keys.key_blocks])
         if item.type == 'ARMATURE':
             data.append([(b.name, [list(row) for row in b.matrix_local]) for b in item.data.bones])
+            data.append([(b.name, [rna_values(c) for c in b.constraints]) for b in item.pose.bones])
             if not item.animation_data:
                 data.append([(b.name, [list(row) for row in b.matrix_basis]) for b in item.pose.bones])
         data.append([rna_values(m, {'execution_time', 'persistent_uid'}) for m in item.modifiers if m.type != 'CLOTH'])
@@ -202,7 +222,7 @@ def signature(scene, obj):
 
 def settings_signature(p):
     excluded = {'bake_signature', 'bake_state', 'bake_error', 'bake_metadata', 'bake_needs_validation',
-                'animator_state', 'cage', 'garment', 'show_fabric_detail', 'custom_steps', 'custom_collision'}
+                'animator_state', 'cage', 'garment', 'show_fabric_detail', 'custom_steps', 'custom_collision', 'diagnostics', 'coverage_text'}
     return hashlib.sha256(json.dumps(rna_values(p, excluded), sort_keys=True).encode()).hexdigest()
 
 
@@ -214,7 +234,12 @@ def state(context, obj):
     if mod.point_cache.is_baking:
         return 'BAKING'
     if mod.point_cache.is_baked:
-        metadata = json.loads(p.bake_metadata or '{}')
+        try:
+            metadata = json.loads(p.bake_metadata or '{}')
+        except (ValueError, TypeError):
+            return 'NEEDS_VALIDATION'
+        if not isinstance(metadata, dict):
+            return 'NEEDS_VALIDATION'
         if metadata.get('settings') != settings_signature(p) or p.bake_state == 'DIRTY':
             return 'DIRTY'
         if p.bake_needs_validation or not p.bake_signature:
