@@ -1225,6 +1225,7 @@ Set Pin Group untouched for manual selections"""
 
 
 
+class QC_OT_make_colliders(Operator):
     """Add a tuned Collision modifier to all selected objects so the cloth
 can rest on them — chairs, bodies, tables. Works on rigged meshes untouched
 (collision uses the deformed mesh, so animated characters collide
@@ -1689,16 +1690,26 @@ classes = (
 )
 
 
+_registered = []
+
+
 def register():
-    for cls in classes:
-        bpy.utils.register_class(cls)
-    bpy.types.Scene.quick_cloth = PointerProperty(type=QuickClothProps)
+    try:
+        for cls in classes:
+            bpy.utils.register_class(cls)
+            _registered.append(cls)
+        bpy.types.Scene.quick_cloth = PointerProperty(type=QuickClothProps)
+    except Exception:
+        unregister()
+        raise
 
 
 def unregister():
-    del bpy.types.Scene.quick_cloth
-    for cls in reversed(classes):
+    if hasattr(bpy.types.Scene, "quick_cloth"):
+        del bpy.types.Scene.quick_cloth
+    for cls in reversed(_registered):
         bpy.utils.unregister_class(cls)
+    _registered.clear()
 
 
 if __name__ == "__main__":
