@@ -52,3 +52,21 @@ def validate_pin_edit(obj):
         raise ValueError('Object and mesh must be editable')
     if obj.data.users > 1:
         raise ValueError('Pin weights affect shared mesh data. Make the mesh single-user first.')
+
+
+def depends_on(obj, target, seen=None):
+    seen = set() if seen is None else seen
+    if obj == target:
+        return True
+    if obj is None or obj.as_pointer() in seen:
+        return False
+    seen.add(obj.as_pointer())
+    dependencies = [obj.parent]
+    for mod in obj.modifiers:
+        dependencies.extend(getattr(mod, name, None) for name in ('object', 'target', 'origin'))
+    dependencies.extend(getattr(c, 'target', None) for c in obj.constraints)
+    if obj.animation_data:
+        for driver in obj.animation_data.drivers:
+            dependencies.extend(t.id for v in driver.driver.variables for t in v.targets
+                                if t.id and hasattr(t.id, 'modifiers'))
+    return any(depends_on(d, target, seen) for d in dependencies if d is not None)

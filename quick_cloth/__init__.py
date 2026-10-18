@@ -54,7 +54,7 @@ from bpy.props import (
 )
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector
-from .validation import geometry_issues, pin_coverage, validate_pin_edit
+from .validation import geometry_issues, pin_coverage, validate_pin_edit, depends_on
 from .quality import resolve as resolve_quality, selection_update as quality_update, values_update as quality_values_update
 
 # ---------------------------------------------------------------------------
@@ -373,6 +373,8 @@ class QuickClothProps(PropertyGroup):
     use_object_collision: BoolProperty(name='Enable Cloth Collisions', default=True)
     body: PointerProperty(name='Body / Obstacle', type=bpy.types.Object,
                           poll=lambda self, obj: obj.type == 'MESH')
+    binding_name: StringProperty()
+    binding_target: PointerProperty(type=bpy.types.Object)
     collider_thickness: FloatProperty(name='New Collider Thickness', default=.005, min=.001, max=1, unit='LENGTH')
     impulse_clamp: FloatProperty(name='Collision Impulse Clamp', default=0, min=0, max=10000)
     self_impulse_clamp: FloatProperty(name='Self Impulse Clamp', default=0, min=0, max=10000)
@@ -1015,75 +1017,60 @@ def cage_name_for(obj):
 
 
 def find_cage(obj):
-    """Return the animation cage for a garment (or None)."""
-    return bpy.data.objects.get(cage_name_for(obj))
+    cage = obj.quick_cloth.cage
+    return cage if owned_helper(cage, obj.quick_cloth) and cage.quick_cloth.garment == obj else None
 
 
 def find_garment_for_cage(cage):
-    """Inverse lookup: cage -> garment object (or None)."""
-    if not cage.name.startswith(CAGE_PREFIX):
-        return None
-    return bpy.data.objects.get(cage.name[len(CAGE_PREFIX):])
+    return cage.quick_cloth.garment
 
 
 def resolve_animator_pair(obj):
-    """Given either the garment or its cage, return (garment, cage) —
-    either may be None."""
-    if obj is None:
+    if obj is None or obj.type != 'MESH':
         return None, None
-    if obj.name.startswith(CAGE_PREFIX):
-        garment = find_garment_for_cage(obj)
-        return garment, obj
+    if obj.get('qc_helper') == 'cage':
+        return obj.quick_cloth.garment, obj
     return obj, find_cage(obj)
 
 
 def animator_mode_active(obj):
-    """True while the garment's cloth is muted and a cage exists — i.e.
-    the user is animating with the stand-in."""
     garment, cage = resolve_animator_pair(obj)
-    if garment is None or cage is None:
-        return False
-    mod = find_cloth_modifier(garment)
-    return mod is not None and not mod.show_viewport
+    return bool(garment and garment.quick_cloth.animator_state)
 
 
 def build_or_update_cage(context, garment, ratio):
-    """Create (or reuse — idempotent) the decimated animation cage.
-
-    The cage is a copy of the garment object: it shares the same parent,
-    constraints, object-level action, vertex groups, and — crucially — the
-    same Armature modifier, so the SAME rig animation drives both. Cloth
-    and Collision modifiers are stripped from the cage (that's the whole
-    point), and a Decimate modifier at the end of the stack lightens the
-    deform. Nothing on the garment itself is duplicated or destroyed.
-    """
-    cage = find_cage(garment)
-    if cage is None:
-        cage = garment.copy()          # shares action/parent/constraints
-        cage.data = garment.data.copy()
-        cage.name = cage_name_for(garment)
-        cage.data.name = cage.name
-        # Link into the same collections as the garment.
-        linked = False
-        for coll in garment.users_collection:
-            coll.objects.link(cage)
-            linked = True
-        if not linked:
-            context.collection.objects.link(cage)
-        # Strip simulation modifiers — the cage must be deform-only.
-        for mod in list(cage.modifiers):
-            if mod.type in {'CLOTH', 'COLLISION'}:
-                cage.modifiers.remove(mod)
-        cage.show_wire = True          # reads visually as "the cage"
-
-    # Decimate last in the stack (after Armature) so weights deform first.
-    dec = None
-    for mod in cage.modifiers:
-        if mod.type == 'DECIMATE':
-            dec = mod
-    if dec is None:
-        dec = cage.modifiers.new(name="QC Cage Decimate", type='DECIMATE')
+    # Rebuild each entry so edited geometry, weights, actions and constraints cannot go stale.
+    p = garment.quick_cloth
+    old = find_cage(garment)
+    if old:
+        old_data = old.data
+        bpy.data.objects.remove(old, do_unlink=True)
+        if old_data.users == 0 and old_data.get('qc_owner') == p.setup_id:
+            bpy.data.meshes.remove(old_data)
+    cage = garment.copy()
+    cage.data = garment.data.copy()
+    cage.name = cage_name_for(garment)
+    cage['qc_owner'] = p.setup_id
+    cage['qc_helper'] = 'cage'
+    cage.data['qc_owner'] = p.setup_id
+    cage.quick_cloth.setup_id = ''
+    cage.quick_cloth.garment = garment
+    cage.quick_cloth.cage = None
+    cage.quick_cloth.wind = None
+    cage.quick_cloth.turbulence = None
+    cage.quick_cloth.animator_state = ''
+    cage.quick_cloth.bake_signature = ''
+    context.collection.objects.link(cage)
+    for mod in list(cage.modifiers):
+        if mod.type in {'CLOTH', 'COLLISION'}:
+            cage.modifiers.remove(mod)
+    dec = cage.modifiers.new(name='QC Cage Decimate', type='DECIMATE')
     dec.ratio = ratio
+    cage.hide_render = True
+    cage.hide_viewport = False
+    cage.hide_set(False)
+    cage.show_wire = True
+    p.cage = cage
     return cage
 
 
@@ -1145,7 +1132,7 @@ Idempotent — run it as often as you like"""
             return {'CANCELLED'}
 
         # Never simulate the cage itself — it's a deform-only stand-in.
-        if obj.name.startswith(CAGE_PREFIX):
+        if obj.get('qc_helper') == 'cage':
             self.report({'ERROR'},
                         "This is the animation cage — select the real "
                         "garment to simulate")
@@ -1599,6 +1586,10 @@ nicely draped couch cushion or hung coat without destroying the sim setup"""
             return {'CANCELLED'}
         new_obj = bpy.data.objects.new(obj.name + "_Draped", mesh)
         new_obj.matrix_world = obj.matrix_world.copy()
+        new_obj.color = obj.color
+        for index, slot in enumerate(obj.material_slots):
+            if index < len(mesh.materials) and slot.material:
+                mesh.materials[index] = slot.material
         context.collection.objects.link(new_obj)
         self.report({'INFO'},
                     f"Created '{new_obj.name}' from frame "
@@ -1614,6 +1605,7 @@ targeting the sim mesh and Bind it. Simulate a 5k-vert proxy, drive a
     bl_idname = "quick_cloth.bind_render_mesh"
     bl_label = "Bind Render Mesh"
     bl_options = {'REGISTER', 'UNDO'}
+    action: EnumProperty(items=[('BIND', 'Bind', ''), ('REBIND', 'Rebind', ''), ('UNBIND', 'Unbind', '')], default='BIND')
 
     @classmethod
     def poll(cls, context):
@@ -1631,27 +1623,59 @@ targeting the sim mesh and Bind it. Simulate a 5k-vert proxy, drive a
             self.report({'ERROR'}, OVERRIDE_MESSAGE)
             return {'CANCELLED'}
 
-        mod = None
-        for m in render_obj.modifiers:
-            if m.type == 'SURFACE_DEFORM':
-                mod = m
-                break
+        if baking.any_baking():
+            self.report({'ERROR'}, 'Wait for the running bake')
+            return {'CANCELLED'}
+        if any(m.type in {'ARMATURE', 'CLOTH'} for m in render_obj.modifiers):
+            self.report({'ERROR'}, 'Use a render mesh without Armature/Cloth; the rig and cloth belong on the simulation proxy')
+            return {'CANCELLED'}
+        if depends_on(sim_obj, render_obj):
+            self.report({'ERROR'}, 'Binding would create a dependency cycle')
+            return {'CANCELLED'}
+        source_mod = find_cloth_modifier(sim_obj)
+        if not source_mod or not sim_obj.quick_cloth.setup_id:
+            self.report({'ERROR'}, 'Active object must be the configured simulation proxy')
+            return {'CANCELLED'}
+        if self.action != 'UNBIND' and context.scene.frame_current != source_mod.point_cache.frame_start:
+            self.report({'ERROR'}, 'Move to the simulation start/rest frame before binding')
+            return {'CANCELLED'}
+
+        rp = render_obj.quick_cloth
+        mod = render_obj.modifiers.get(rp.binding_name) if rp.binding_name else None
+        if rp.binding_name and (not mod or mod.type != 'SURFACE_DEFORM' or mod.target != rp.binding_target):
+            self.report({'ERROR'}, 'Managed binding was renamed, removed or retargeted; restore its modifier/target before continuing')
+            return {'CANCELLED'}
+        if mod and mod.is_bound and self.action == 'BIND':
+            self.report({'ERROR'}, 'Already bound; choose Rebind or Unbind explicitly')
+            return {'CANCELLED'}
+        if self.action == 'UNBIND' and (not mod or not mod.is_bound):
+            self.report({'ERROR'}, 'No owned bound modifier to unbind')
+            return {'CANCELLED'}
         if mod is None:
             mod = render_obj.modifiers.new(name="QC Surface Deform",
                                            type='SURFACE_DEFORM')
-        mod.target = sim_obj
+            rp.binding_name = mod.name
 
         was_bound = mod.is_bound
         try:
             with context.temp_override(object=render_obj,
                                        active_object=render_obj,
                                        selected_objects=[render_obj]):
-                bpy.ops.object.surfacedeform_bind(modifier=mod.name)
+                if mod.is_bound:
+                    result = bpy.ops.object.surfacedeform_bind(modifier=mod.name)
+                    if result != {'FINISHED'} or mod.is_bound:
+                        raise ValueError('Could not unbind owned modifier')
+                if self.action != 'UNBIND':
+                    mod.target = sim_obj
+                    rp.binding_target = sim_obj
+                    result = bpy.ops.object.surfacedeform_bind(modifier=mod.name)
+                    if result != {'FINISHED'} or not mod.is_bound:
+                        raise ValueError('Binding failed; check mesh topology and rest pose')
         except Exception as exc:
             self.report({'ERROR'}, f"Bind failed: {exc}")
             return {'CANCELLED'}
 
-        if was_bound:
+        if self.action == 'UNBIND':
             self.report({'INFO'},
                         f"Unbound '{render_obj.name}' from "
                         f"'{sim_obj.name}'")
@@ -1670,102 +1694,83 @@ targeting the sim mesh and Bind it. Simulate a 5k-vert proxy, drive a
 
 
 class QC_OT_enter_animator_mode(Operator):
-    """Swap the garment for a lightweight decimated cage while you animate:
-the cage follows the SAME rig (same Armature modifier, same action — no
-keyframes need transferring), while the real garment is hidden and its
-cloth modifier is fully muted, so nothing is solved and no cache eats RAM.
-Animate freely, then Exit Animator Mode when the performance is locked"""
-    bl_idname = "quick_cloth.enter_animator_mode"
-    bl_label = "Enter Animator Mode"
+    bl_idname = 'quick_cloth.enter_animator_mode'
+    bl_label = 'Enter Animator Mode'
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        if obj is None or obj.type != 'MESH' or context.mode != 'OBJECT':
-            return False
-        garment, _cage = resolve_animator_pair(obj)
-        return garment is not None and not animator_mode_active(obj)
+        return bool(obj and obj.type == 'MESH' and context.mode == 'OBJECT'
+                    and obj.quick_cloth.setup_id and find_cloth_modifier(obj)
+                    and not obj.quick_cloth.garment and not animator_mode_active(obj)
+                    and not baking.any_baking())
 
     def execute(self, context):
-        props = get_props(context)
-        garment, _cage = resolve_animator_pair(context.active_object)
-
+        garment = context.active_object
         if object_is_override_locked(garment):
-            self.report({'ERROR'}, OVERRIDE_MESSAGE)
+            self.report({'ERROR'}, 'Garment is not editable')
             return {'CANCELLED'}
-
-        cage = build_or_update_cage(context, garment, props.cage_ratio)
-
-        # Mute the cloth entirely: no solving during playback, no point
-        # cache accumulating in RAM. (Muting beats hiding alone — a hidden
-        # object with a live modifier can still be pulled into evaluation
-        # by dependencies.)
+        p = garment.quick_cloth
         mod = find_cloth_modifier(garment)
-        if mod is not None:
-            mod.show_viewport = False
-
-        # Hide the garment, present the cage.
+        state = {'hidden': garment.hide_get(), 'hide_viewport': garment.hide_viewport,
+                 'cloth_viewport': mod.show_viewport}
+        try:
+            cage = build_or_update_cage(context, garment, p.cage_ratio)
+        except Exception as exc:
+            self.report({'ERROR'}, f'Cage creation failed: {exc}')
+            return {'CANCELLED'}
+        p.animator_state = json.dumps(state)
+        mod.show_viewport = False
         garment.hide_set(True)
-        cage.hide_set(False)
-        cage.hide_viewport = False
-        for o in context.selected_objects:
-            o.select_set(False)
+        for obj in context.selected_objects:
+            obj.select_set(False)
         cage.select_set(True)
         context.view_layer.objects.active = cage
-
-        self.report({'INFO'},
-                    f"Animator Mode ON — animating with '{cage.name}' "
-                    f"({props.cage_ratio:.0%} detail). The cage follows the "
-                    "same rig; your keyframes live on the armature and "
-                    "apply to the real garment automatically")
+        self.report({'INFO'}, 'Animator Mode: cloth muted; cage excluded from rendering')
         return {'FINISHED'}
 
 
 class QC_OT_exit_animator_mode(Operator):
-    """Bring the real garment back: unhide it, un-mute its cloth modifier,
-hide the cage, and free the (now stale) cache. Because the animation lives
-on the rig — which garment and cage share — the cloth picks up the finished
-performance immediately. Hit Simulate Cloth! to refresh ranges, then Bake"""
-    bl_idname = "quick_cloth.exit_animator_mode"
-    bl_label = "Exit Animator Mode"
+    bl_idname = 'quick_cloth.exit_animator_mode'
+    bl_label = 'Exit / Recover Animator Mode'
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return animator_mode_active(context.active_object)
+        return not baking.any_baking() and any(o.type == 'MESH' and o.quick_cloth.animator_state
+                                              for o in context.scene.objects)
 
     def execute(self, context):
         garment, cage = resolve_animator_pair(context.active_object)
-
-        # Restore the garment.
-        garment.hide_set(False)
-        garment.hide_viewport = False
+        if not garment or not garment.quick_cloth.animator_state:
+            candidates = [o for o in context.scene.objects if o.type == 'MESH' and o.quick_cloth.animator_state]
+            if len(candidates) != 1:
+                self.report({'ERROR'}, 'Select the garment to recover; multiple Animator Mode setups exist')
+                return {'CANCELLED'}
+            garment = candidates[0]
+            cage = find_cage(garment)
+        if garment.name not in context.view_layer.objects:
+            self.report({'ERROR'}, 'Include the garment collection in this view layer before recovery')
+            return {'CANCELLED'}
+        p = garment.quick_cloth
+        state = json.loads(p.animator_state)
+        garment.hide_viewport = state['hide_viewport']
+        garment.hide_set(state['hidden'])
         mod = find_cloth_modifier(garment)
-        if mod is not None:
-            mod.show_viewport = True
-            # The animation changed while the sim was muted — any cached
-            # frames are stale and would freeze the new setup. Free them
-            # (version-fragile op → guarded temp_override).
-            try:
-                with context.temp_override(scene=context.scene,
-                                           point_cache=mod.point_cache):
-                    bpy.ops.ptcache.free_bake()
-            except Exception:
-                pass
-
-        # Park the cage (kept for next time — idempotent reuse).
-        if cage is not None:
+        if mod:
+            mod.show_viewport = state['cloth_viewport']
+        if cage:
             cage.hide_set(True)
-        for o in context.selected_objects:
-            o.select_set(False)
-        garment.select_set(True)
+            cage.hide_render = True
+        p.animator_state = ''
+        p.bake_needs_validation = True
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        if not garment.hide_get():
+            garment.select_set(True)
         context.view_layer.objects.active = garment
-
-        self.report({'INFO'},
-                    "Animator Mode OFF — garment restored, stale cache "
-                    "freed. Run Simulate Cloth! to refresh the sim range, "
-                    "then Bake")
+        self.report({'INFO'}, 'Garment restored; existing bake preserved. Validate or rebuild after animation edits.')
         return {'FINISHED'}
 
 
@@ -1920,7 +1925,10 @@ class QC_PT_panel(Panel):
         except ValueError as exc:
             box.label(text=str(exc), icon='ERROR')
         box.operator("quick_cloth.apply_as_shape", icon='MESH_DATA')
-        box.operator("quick_cloth.bind_render_mesh", icon='MOD_MESHDEFORM')
+        row = box.row(align=True)
+        for action in ('BIND', 'REBIND', 'UNBIND'):
+            op = row.operator('quick_cloth.bind_render_mesh', text=action.title())
+            op.action = action
 
         # 6b. Animator Mode box.
         box = layout.box()
@@ -1934,6 +1942,7 @@ class QC_PT_panel(Panel):
             box.prop(props, "cage_ratio")
             box.operator("quick_cloth.enter_animator_mode",
                          icon='MESH_GRID')
+            box.operator('quick_cloth.exit_animator_mode', text='Recover Hidden Garment')
 
         # 7. Big final button.
         layout.separator()
