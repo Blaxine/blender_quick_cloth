@@ -145,6 +145,12 @@ def free(context, obj):
 def action_data(animation):
     if not animation:
         return None
+    def curves_data(curves):
+        return [(f.data_path, f.array_index, f.mute, f.extrapolation,
+                 [(tuple(k.co), tuple(k.handle_left), tuple(k.handle_right), k.interpolation, k.easing) for k in f.keyframe_points],
+                 [rna_values(m) for m in f.modifiers], [tuple(k.co) for k in f.sampled_points])
+                for f in curves]
+
     def action(action):
         if not action:
             return None
@@ -153,15 +159,25 @@ def action_data(animation):
             for strip in layer.strips:
                 for bag in getattr(strip, 'channelbags', ()):
                     curves.extend(bag.fcurves)
-        return [action.name, [(f.data_path, f.array_index, f.mute, f.extrapolation,
-                 [(tuple(k.co), tuple(k.handle_left), tuple(k.handle_right), k.interpolation, k.easing) for k in f.keyframe_points],
-                 [rna_values(m) for m in f.modifiers], [tuple(k.co) for k in f.sampled_points])
-                for f in curves]]
-    return [action(animation.action),
-            [(t.mute, [(s.name, s.frame_start, s.frame_end, s.scale, s.repeat, s.influence, s.blend_type, action(s.action))
-                       for s in t.strips]) for t in animation.nla_tracks],
+        return [action.name, curves_data(curves)]
+
+    def strip_data(strip):
+        # Animated controls are represented by their curves, not the value at
+        # the current timeline position. Selection is UI state only.
+        excluded = {'select'}
+        if not strip.use_animated_time or any(f.data_path == 'strip_time' and not f.mute for f in strip.fcurves):
+            excluded.add('strip_time')
+        if strip.use_animated_influence:
+            excluded.add('influence')
+        return [rna_values(strip, excluded), action(strip.action),
+                curves_data(strip.fcurves), [rna_values(m) for m in strip.modifiers],
+                [strip_data(child) for child in strip.strips]]
+
+    return [rna_values(animation), action(animation.action),
+            [(t.mute, t.is_solo, [strip_data(s) for s in t.strips]) for t in animation.nla_tracks],
             [(d.data_path, d.driver.type, d.driver.expression, [rna_values(m) for m in d.modifiers], [(v.name, v.type, [(t.id.name if t.id else '', t.data_path) for t in v.targets])
                                                for v in d.driver.variables]) for d in animation.drivers]]
+
 
 
 def rna_values(data, excluded=()):
@@ -192,7 +208,11 @@ def static_transform_channels(item, animation, prefix=''):
     curves = []
     if animation:
         actions = [animation.action]
-        actions.extend(strip.action for track in animation.nla_tracks for strip in track.strips)
+        if animation.use_nla:
+            solo = any(track.is_solo for track in animation.nla_tracks)
+            actions.extend(strip.action for track in animation.nla_tracks
+                           if not track.mute and (not solo or track.is_solo)
+                           for strip in track.strips if not strip.mute)
         curves.extend(animation.drivers)
         for action in actions:
             if action is None:

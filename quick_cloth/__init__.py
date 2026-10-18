@@ -933,6 +933,7 @@ def initialize_setup(obj, scene, adopt=False):
                           object_distance=mod.collision_settings.distance_min,
                           self_distance=mod.collision_settings.self_distance_min,
                           pressure_force=mod.settings.uniform_pressure_force,
+                          gravity_influence=mod.settings.effector_weights.gravity,
                           sewing_force=mod.settings.sewing_force_max,
                           internal_stiffness=mod.settings.internal_tension_stiffness)
             for key, value in native.items():
