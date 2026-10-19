@@ -1342,30 +1342,32 @@ Set Pin Group untouched for manual selections"""
         # via vertex.groups is direct data access — no ops, no mode
         # switches, selection untouched.
         pin_group = obj.vertex_groups.get(obj.quick_cloth.pin_group)
-        if pin_group is None:
-            pin_group = obj.vertex_groups.new(name='QC Attachment')
-        obj.quick_cloth.pin_group = pin_group.name
-        pin_index = pin_group.index
+        if pin_group is not None and pin_group.name in armature.bones:
+            self.report({'ERROR'}, 'Attachment destination is a rig bone group; choose a separate '
+                        'attachment group or clear the attachment field to create one. Bone weights are unchanged.')
+            return {'CANCELLED'}
 
-        weighted = 0
-        for v in obj.data.vertices:
-            total = 0.0
-            for g in v.groups:
-                if g.group in deform_group_indices:
-                    total += g.weight
-            total = min(total, 1.0)
-            if total > 0.0:
-                pin_group.add([v.index], total, 'REPLACE')
-                weighted += 1
-            elif any(g.group == pin_index for g in v.groups):
-                pin_group.remove([v.index])
-
+        # Stage and validate the complete result before creating or editing pins.
+        weights = [(v.index, min(sum(g.weight for g in v.groups
+                                    if g.group in deform_group_indices), 1.0))
+                   for v in obj.data.vertices]
+        weighted = sum(weight > 0.0 for _, weight in weights)
         if weighted == 0:
             self.report({'ERROR'},
                         "The rig's deform bones carry no weight on this "
                         "mesh — automatic weighting may have failed "
-                        "(overlapping or non-manifold geometry)")
+                        "(overlapping or non-manifold geometry). Existing attachments are unchanged.")
             return {'CANCELLED'}
+
+        if pin_group is None:
+            pin_group = obj.vertex_groups.new(name='QC Attachment')
+        pin_index = pin_group.index
+        for index, weight in weights:
+            if weight > 0.0:
+                pin_group.add([index], weight, 'REPLACE')
+            elif any(g.group == pin_index for g in obj.data.vertices[index].groups):
+                pin_group.remove([index])
+        obj.quick_cloth.pin_group = pin_group.name
 
         self.report({'INFO'},
                     f"Pin group '{pin_group.name}' built from rig weights "

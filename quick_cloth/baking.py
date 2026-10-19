@@ -175,7 +175,7 @@ def action_data(animation):
 
     return [rna_values(animation), action(animation.action),
             [(t.mute, t.is_solo, [strip_data(s) for s in t.strips]) for t in animation.nla_tracks],
-            [(d.data_path, d.driver.type, d.driver.expression, [rna_values(m) for m in d.modifiers], [(v.name, v.type, [(t.id.name if t.id else '', t.data_path) for t in v.targets])
+            [(d.data_path, d.mute, d.driver.type, d.driver.expression, d.driver.use_self, [rna_values(m) for m in d.modifiers], [(v.name, v.type, [rna_values(t, {'is_fallback_used'}) for t in v.targets])
                                                for v in d.driver.variables]) for d in animation.drivers]]
 
 
@@ -190,7 +190,7 @@ def rna_values(data, excluded=()):
             value = getattr(data, key)
             if prop.type == 'POINTER':
                 values[key] = getattr(value, 'name_full', None)
-            elif prop.is_array:
+            elif getattr(prop, 'is_array', False):
                 values[key] = list(value)
             elif isinstance(value, (bool, int, float, str)):
                 values[key] = value
@@ -248,6 +248,8 @@ def signature(scene, obj):
                 sorted(c.name for c in item.users_collection),
                 {k: item[k] for k in item.keys() if k != 'quick_cloth' and not k.startswith('qc_')},
                 action_data(item.animation_data), [rna_values(c) for c in item.constraints]]
+        data.append([item.parent_type, item.parent_bone, list(item.parent_vertices),
+                     [list(row) for row in item.matrix_parent_inverse]])
         data.append(static_transform_channels(item, item.animation_data))
         if item.type == 'MESH':
             data.extend([[(tuple(v.co), [(g.group, g.weight) for g in v.groups]) for v in item.data.vertices],
