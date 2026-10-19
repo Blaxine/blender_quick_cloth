@@ -28,7 +28,15 @@ def geometry_issues(obj, depsgraph=None):
         errors.append('Mesh has nonfinite coordinates')
     if any(p.area < 1e-12 for p in data.polygons):
         errors.append('Mesh contains zero-area faces; repair them before simulation')
-    for mod in obj.modifiers:
+    # Validate the stack setup/bake will actually use, without mutating it.
+    modifiers = list(obj.modifiers)
+    cloths = [m for m in modifiers if m.type == 'CLOTH']
+    if cloths:
+        cloth_index = modifiers.index(cloths[0])
+        arm_indices = [i for i, m in enumerate(modifiers) if m.type == 'ARMATURE']
+        if arm_indices and cloth_index < arm_indices[-1]:
+            modifiers.insert(arm_indices[-1], modifiers.pop(cloth_index))
+    for mod in modifiers:
         if mod.type == 'CLOTH':
             break
         if not mod.show_viewport:
