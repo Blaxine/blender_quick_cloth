@@ -10,3 +10,5 @@
 Tests are in `tests/test_sixth_review.py`. Full regression results on Blender 4.1.1 and 5.1.2 are recorded in `tests/results/summary.json`.
 
 Expanded signatures require validation/rebaking of caches recorded with older signatures. These fixes do not close the remaining interactive cancellation, complex collision, performance, or Blender 4.2/4.5 acceptance gates.
+
+The driver regression also exposed a shared RNA serializer defect: accessing `is_array` on string/enum property descriptors raised an AttributeError and silently skipped those properties. Using a guarded attribute lookup now includes their values in signatures. Driver axis/space assertions cover this path.

@@ -3,238 +3,238 @@
     "version": "Blender 4.1.1",
     "test": "test_animator.py",
     "passed": true,
-    "seconds": 2.104,
+    "seconds": 2.126,
     "log": "Blender_4_1_1_test_animator.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_baking.py",
     "passed": true,
-    "seconds": 1.979,
+    "seconds": 1.948,
     "log": "Blender_4_1_1_test_baking.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_collisions.py",
     "passed": true,
-    "seconds": 1.991,
+    "seconds": 1.963,
     "log": "Blender_4_1_1_test_collisions.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_failure.py",
     "passed": true,
-    "seconds": 1.979,
+    "seconds": 2.167,
     "log": "Blender_4_1_1_test_failure.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_fifth_review.py",
     "passed": true,
-    "seconds": 2.135,
+    "seconds": 1.968,
     "log": "Blender_4_1_1_test_fifth_review.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_fourth_review.py",
     "passed": true,
-    "seconds": 1.953,
+    "seconds": 2.144,
     "log": "Blender_4_1_1_test_fourth_review.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_geometry.py",
     "passed": true,
-    "seconds": 1.984,
+    "seconds": 2.025,
     "log": "Blender_4_1_1_test_geometry.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_ownership.py",
     "passed": true,
-    "seconds": 1.982,
+    "seconds": 2.199,
     "log": "Blender_4_1_1_test_ownership.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_package.py",
     "passed": true,
-    "seconds": 2.236,
+    "seconds": 2.309,
     "log": "Blender_4_1_1_test_package.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_proxy.py",
     "passed": true,
-    "seconds": 2.143,
+    "seconds": 2.057,
     "log": "Blender_4_1_1_test_proxy.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_quality.py",
     "passed": true,
-    "seconds": 2.054,
+    "seconds": 1.935,
     "log": "Blender_4_1_1_test_quality.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_registration.py",
     "passed": true,
-    "seconds": 2.038,
+    "seconds": 1.968,
     "log": "Blender_4_1_1_test_registration.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_review_regressions.py",
     "passed": true,
-    "seconds": 1.987,
+    "seconds": 1.932,
     "log": "Blender_4_1_1_test_review_regressions.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_simulation.py",
     "passed": true,
-    "seconds": 2.11,
+    "seconds": 2.085,
     "log": "Blender_4_1_1_test_simulation.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_sixth_review.py",
-    "passed": false,
-    "seconds": 2.108,
+    "passed": true,
+    "seconds": 2.184,
     "log": "Blender_4_1_1_test_sixth_review.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_storage.py",
     "passed": true,
-    "seconds": 2.097,
+    "seconds": 2.294,
     "log": "Blender_4_1_1_test_storage.log"
   },
   {
     "version": "Blender 4.1.1",
     "test": "test_third_review.py",
     "passed": true,
-    "seconds": 2.072,
+    "seconds": 2.082,
     "log": "Blender_4_1_1_test_third_review.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_animator.py",
     "passed": true,
-    "seconds": 2.03,
+    "seconds": 2.197,
     "log": "Blender_5_1_2_test_animator.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_baking.py",
     "passed": true,
-    "seconds": 1.952,
+    "seconds": 1.937,
     "log": "Blender_5_1_2_test_baking.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_collisions.py",
     "passed": true,
-    "seconds": 2.152,
+    "seconds": 1.822,
     "log": "Blender_5_1_2_test_collisions.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_failure.py",
     "passed": true,
-    "seconds": 1.975,
+    "seconds": 1.976,
     "log": "Blender_5_1_2_test_failure.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_fifth_review.py",
     "passed": true,
-    "seconds": 2.066,
+    "seconds": 2.147,
     "log": "Blender_5_1_2_test_fifth_review.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_fourth_review.py",
     "passed": true,
-    "seconds": 2.068,
+    "seconds": 1.8,
     "log": "Blender_5_1_2_test_fourth_review.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_geometry.py",
     "passed": true,
-    "seconds": 2.117,
+    "seconds": 1.785,
     "log": "Blender_5_1_2_test_geometry.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_ownership.py",
     "passed": true,
-    "seconds": 2.122,
+    "seconds": 2.094,
     "log": "Blender_5_1_2_test_ownership.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_package.py",
     "passed": true,
-    "seconds": 2.127,
+    "seconds": 2.075,
     "log": "Blender_5_1_2_test_package.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_proxy.py",
     "passed": true,
-    "seconds": 1.912,
+    "seconds": 1.826,
     "log": "Blender_5_1_2_test_proxy.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_quality.py",
     "passed": true,
-    "seconds": 2.055,
+    "seconds": 1.866,
     "log": "Blender_5_1_2_test_quality.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_registration.py",
     "passed": true,
-    "seconds": 2.125,
+    "seconds": 1.774,
     "log": "Blender_5_1_2_test_registration.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_review_regressions.py",
     "passed": true,
-    "seconds": 2.1,
+    "seconds": 1.756,
     "log": "Blender_5_1_2_test_review_regressions.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_simulation.py",
     "passed": true,
-    "seconds": 2.135,
+    "seconds": 1.87,
     "log": "Blender_5_1_2_test_simulation.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_sixth_review.py",
-    "passed": false,
-    "seconds": 1.937,
+    "passed": true,
+    "seconds": 1.758,
     "log": "Blender_5_1_2_test_sixth_review.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_storage.py",
     "passed": true,
-    "seconds": 1.936,
+    "seconds": 1.783,
     "log": "Blender_5_1_2_test_storage.log"
   },
   {
     "version": "Blender 5.1.2",
     "test": "test_third_review.py",
     "passed": true,
-    "seconds": 1.93,
+    "seconds": 1.813,
     "log": "Blender_5_1_2_test_third_review.log"
   }
 ]
