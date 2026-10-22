@@ -36,7 +36,8 @@ from bpy.props import (
 )
 from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
 from mathutils import Vector
-from .validation import geometry_issues, pin_coverage, validate_pin_edit, depends_on, editable, contact_warnings
+from .validation import (geometry_issues, pin_coverage, validate_pin_edit, depends_on, editable, contact_warnings,
+                         short_edge_length, safe_self_gap)
 from .quality import resolve as resolve_quality, selection_update as quality_update, values_update as quality_values_update
 
 # ---------------------------------------------------------------------------
@@ -101,7 +102,7 @@ PRESETS = {
         "collision_quality": 3,
         "time_scale": 1.0,
         "use_self_collision": True,
-        "self_distance": 0.010,
+        "self_distance": 0.005,
         "object_distance": 0.015,
         "fit_tightness": 0.0,
         "use_sewing": False,
@@ -123,7 +124,7 @@ PRESETS = {
         "collision_quality": 3,
         "time_scale": 1.0,
         "use_self_collision": True,
-        "self_distance": 0.010,
+        "self_distance": 0.005,
         "object_distance": 0.015,
         "fit_tightness": 0.0,
         "use_sewing": False,
@@ -139,13 +140,13 @@ PRESETS = {
         "tension_damping": 25.0,
         "compression_damping": 25.0,
         "shear_damping": 20.0,
-        "bending_damping": 15.0,
+        "bending_damping": 4.0,    # higher values jitter on this mass (measured in 5.2)
         "air_damping": 1.0,
         "quality_steps": 15,
         "collision_quality": 4,
         "time_scale": 0.9,  # a touch slow-motion = reads as heavy
         "use_self_collision": False,
-        "self_distance": 0.020,
+        "self_distance": 0.005,
         "object_distance": 0.015,
         "fit_tightness": 0.0,
         "use_sewing": False,
@@ -161,13 +162,13 @@ PRESETS = {
         "tension_damping": 15.0,
         "compression_damping": 15.0,
         "shear_damping": 12.0,
-        "bending_damping": 8.0,
+        "bending_damping": 2.0,     # higher values jitter on this mass (measured in 5.2)
         "air_damping": 1.2,
         "quality_steps": 12,
         "collision_quality": 4,
         "time_scale": 1.0,
         "use_self_collision": True,
-        "self_distance": 0.012,
+        "self_distance": 0.005,
         "object_distance": 0.015,
         "fit_tightness": 0.0,
         "use_sewing": False,
@@ -189,7 +190,7 @@ PRESETS = {
         "collision_quality": 5,
         "time_scale": 1.0,
         "use_self_collision": True,   # mandatory for skin-tight fits
-        "self_distance": 0.006,
+        "self_distance": 0.004,
         "object_distance": 0.015,
         "fit_tightness": 0.12,        # positive shrink tightens onto the body
         "use_sewing": True,
@@ -211,7 +212,7 @@ PRESETS = {
         "collision_quality": 4,
         "time_scale": 1.0,
         "use_self_collision": True,
-        "self_distance": 0.010,
+        "self_distance": 0.005,
         "object_distance": 0.015,
         "fit_tightness": 0.04,        # light hug fit
         "use_sewing": False,
@@ -233,7 +234,7 @@ PRESETS = {
         "collision_quality": 4,
         "time_scale": 1.0,
         "use_self_collision": True,
-        "self_distance": 0.012,
+        "self_distance": 0.005,
         "object_distance": 0.015,
         "fit_tightness": 0.0,
         "use_sewing": False,
@@ -255,7 +256,7 @@ PRESETS = {
         "collision_quality": 4,
         "time_scale": 1.0,
         "use_self_collision": True,
-        "self_distance": 0.012,
+        "self_distance": 0.005,
         "object_distance": 0.015,
         "fit_tightness": 0.0,
         "use_sewing": False,
@@ -593,8 +594,9 @@ class QuickClothProps(PropertyGroup):
     )
     self_distance: FloatProperty(
         name="Gap to Itself",
-        description="Space the cloth keeps from itself. Too large looks puffy; "
-                    "too small can miss contacts and explode",
+        description="Space the cloth keeps from itself. Keep it under a third of "
+                    "the mesh's short edges (about 5 mm for 2 cm edges): larger "
+                    "gaps make the cloth jitter or explode",
         default=0.015, min=0.001, max=0.1, unit='LENGTH',
     )
 
@@ -1424,6 +1426,32 @@ Rigged characters keep working and collide as they move. Existing colliders are 
         return {'FINISHED'}
 
 
+class QC_OT_fit_self_gap(Operator):
+    """Set Gap to Itself to a quarter of this mesh's short edges, the largest gap that stays stable"""
+    bl_idname = 'quick_cloth.fit_self_gap'
+    bl_label = 'Use Safe Gap'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH' and editable(obj)
+
+    def execute(self, context):
+        obj = context.active_object
+        short = short_edge_length(obj)
+        if short <= 0:
+            self.report({'ERROR'}, 'The mesh has no edges to measure')
+            return {'CANCELLED'}
+        p = obj.quick_cloth
+        p.self_distance = safe_self_gap(short)
+        mod = find_cloth_modifier(obj)
+        if mod is not None and not mod.point_cache.is_baked and not object_is_override_locked(obj):
+            mod.collision_settings.self_distance_min = p.self_distance
+        self.report({'INFO'}, f'Gap to Itself set to {p.self_distance * 1000:.1f} mm')
+        return {'FINISHED'}
+
+
 class QC_OT_body_collider(Operator):
     """Make the chosen body a collider so the cloth rests on it. No rigid-body physics is added"""
     bl_idname = 'quick_cloth.body_collider'
@@ -1931,6 +1959,22 @@ def hint(layout, context, text):
         wrapped(layout, context, text, icon='INFO')
 
 
+_short_edges = {}
+
+
+def cached_short_edge(obj):
+    """short_edge_length for drawing; recomputed when topology or scale changes."""
+    if obj is None or obj.type != 'MESH' or obj.mode == 'EDIT':
+        return 0.0
+    key = (obj.data.as_pointer(), len(obj.data.vertices), len(obj.data.edges),
+           tuple(round(v, 5) for v in obj.matrix_world.to_scale()))
+    if key not in _short_edges:
+        if len(_short_edges) > 64:
+            _short_edges.clear()
+        _short_edges[key] = short_edge_length(obj)
+    return _short_edges[key]
+
+
 def is_cage(obj):
     return bool(obj and obj.get('qc_helper') == 'cage')
 
@@ -2133,6 +2177,13 @@ class QC_PT_collisions(QCStepPanel, Panel):
         layout.prop(props, "use_self_collision")
         if props.use_self_collision:
             layout.prop(props, "self_distance")
+            short = cached_short_edge(context.active_object)
+            if short > 0 and props.self_distance > short / 3:
+                wrapped(layout, context, f'Too large for this mesh (short edges {short * 1000:.1f} mm): '
+                                         'the cloth will jitter or explode', icon='ERROR')
+                layout.operator('quick_cloth.fit_self_gap', icon='CHECKMARK')
+            elif short > 0:
+                hint(layout, context, f'Keep it under a third of the short edges ({short * 1000:.1f} mm).')
         layout.operator('quick_cloth.diagnose', icon='VIEWZOOM')
         for message in props.diagnostics.splitlines():
             wrapped(layout, context, message, icon='INFO')
@@ -2321,6 +2372,7 @@ classes = (
     QC_OT_set_pin_group,
     QC_OT_pin_from_rig_weights,
     QC_OT_make_colliders,
+    QC_OT_fit_self_gap,
     QC_OT_body_collider,
     QC_OT_remove_wind,
     QC_OT_bake,

@@ -1,6 +1,8 @@
 """Context-light preflight shared by setup and baking."""
 import math
 
+import numpy as np
+
 
 def editable(data):
     if data is None:
@@ -8,6 +10,47 @@ def editable(data):
     override = getattr(data, 'override_library', None)
     return (getattr(data, 'is_editable', data.library is None or override is not None)
             and not (override and getattr(override, 'is_system_override', False)))
+
+
+def short_edge_length(obj):
+    """5th-percentile world-space edge length: the size self-collision has to respect."""
+    data = obj.data
+    if not data.edges or not data.vertices:
+        return 0.0
+    co = np.empty(len(data.vertices) * 3, dtype=np.float32)
+    data.vertices.foreach_get('co', co)
+    pairs = np.empty(len(data.edges) * 2, dtype=np.int32)
+    data.edges.foreach_get('vertices', pairs)
+    co, pairs = co.reshape(-1, 3), pairs.reshape(-1, 2)
+    lengths = np.linalg.norm(co[pairs[:, 0]] - co[pairs[:, 1]], axis=1)
+    lengths = lengths[lengths > 1e-9]
+    if not lengths.size:
+        return 0.0
+    scale = sum(abs(v) for v in obj.matrix_world.to_scale()) / 3
+    return float(np.percentile(lengths, 5)) * scale
+
+
+def safe_self_gap(short):
+    """A quarter of the short edge, floored to 0.5 mm steps; larger gaps make the solver explode."""
+    return max(0.001, math.floor(short / 4 / 0.0005 + 1e-3) * 0.0005)
+
+
+def self_gap_issue(obj):
+    """(blocking, text) when the self-collision gap is large for this mesh, else None.
+
+    Measured in 5.2: half the short edge already jitters and bunches; a quarter is stable.
+    """
+    props = getattr(obj, 'quick_cloth', None)
+    if props is None or not props.use_self_collision:
+        return None
+    short = short_edge_length(obj)
+    if short <= 0 or props.self_distance <= short / 3:
+        return None
+    blocking = props.self_distance > short * 0.45
+    effect = 'makes the cloth jitter or explode' if blocking else 'can make the cloth jitter'
+    return blocking, (f'Gap to Itself ({props.self_distance * 1000:.1f} mm) is large for this mesh: its short '
+                      f'edges are {short * 1000:.1f} mm, and a gap that size {effect}. '
+                      f'Use {safe_self_gap(short) * 1000:.1f} mm (Collisions > Use Safe Gap)')
 
 
 def geometry_issues(obj, depsgraph=None):
@@ -51,6 +94,10 @@ def geometry_issues(obj, depsgraph=None):
         warnings.append('Mesh data is shared; make it single-user before editing pin weights')
     if len(obj.users_scene) > 1:
         errors.append('Garment is shared across scenes; use a single-scene object copy for independent simulation')
+    if not errors:
+        gap = self_gap_issue(obj)
+        if gap:
+            (errors if gap[0] else warnings).append(gap[1])
     if len(data.vertices) > 100000:
         warnings.append('More than 100,000 simulation vertices: consider a lower-resolution proxy')
     return errors, warnings
