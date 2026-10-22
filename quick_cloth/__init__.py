@@ -34,7 +34,7 @@ from bpy.props import (
     PointerProperty,
     StringProperty,
 )
-from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
+from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 from mathutils import Vector
 from .validation import (geometry_issues, pin_coverage, validate_pin_edit, depends_on, editable, contact_warnings,
                          short_edge_length, safe_self_gap)
@@ -337,6 +337,13 @@ class QCSetupRef(PropertyGroup):
     owner: PointerProperty(type=bpy.types.Object)
 
 
+class QCColliderItem(PropertyGroup):
+    object: PointerProperty(
+        name='Collider', type=bpy.types.Object,
+        description='A mesh the cloth hits: furniture, a floor, another body',
+        poll=lambda self, obj: obj.type == 'MESH' and obj != self.id_data)
+
+
 class QuickClothProps(PropertyGroup):
     """Per-garment settings; Scene settings are defaults for new setups only."""
 
@@ -374,9 +381,11 @@ class QuickClothProps(PropertyGroup):
                     'Turn off only for cloth that should pass through everything',
         default=True)
     body: PointerProperty(
-        name='Body / Obstacle', type=bpy.types.Object,
+        name='Main Body', type=bpy.types.Object,
         description='The character or object this cloth rests on or wraps around',
         poll=lambda self, obj: obj.type == 'MESH')
+    colliders: CollectionProperty(type=QCColliderItem)
+    collider_index: IntProperty()
     binding_name: StringProperty()
     binding_target: PointerProperty(type=bpy.types.Object)
     diagnostics: StringProperty()
@@ -959,7 +968,8 @@ def initialize_setup(obj, scene, adopt=False):
         excluded = {'rna_type', 'setup_id', 'data_version', 'cage', 'garment', 'wind',
                     'turbulence', 'animator_state', 'legacy_fit', 'preset',
                     'bake_state', 'bake_error', 'bake_signature', 'bake_metadata', 'bake_needs_validation',
-                    'binding_name', 'binding_target', 'quality_steps', 'collision_quality', 'diagnostics', 'coverage_text'}
+                    'binding_name', 'binding_target', 'quality_steps', 'collision_quality', 'diagnostics', 'coverage_text',
+                    'colliders', 'collider_index'}
         for prop in p.bl_rna.properties:
             key = prop.identifier
             if (key not in excluded and not prop.is_readonly and prop.type != 'POINTER'
@@ -1454,21 +1464,76 @@ class QC_OT_fit_self_gap(Operator):
 
 
 class QC_OT_body_collider(Operator):
-    """Make the chosen body a collider so the cloth rests on it. No rigid-body physics is added"""
+    """Make the main body and every mesh in the collider list colliders, so the cloth rests on them.
+No rigid-body physics is added, and existing colliders are left as they are"""
     bl_idname = 'quick_cloth.body_collider'
-    bl_label = 'Make Body a Collider'
+    bl_label = 'Make Them Colliders'
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        targets = baking.collision_targets(get_props(context))
+        if not targets:
+            self.report({'ERROR'}, 'Choose a main body or add meshes to the collider list first')
+            return {'CANCELLED'}
+        made, failed = 0, []
+        for obj in targets:
+            if baking.is_collider(obj):
+                continue
+            try:
+                make_collider(obj, get_props(context).collider_thickness)
+                made += 1
+            except ValueError as exc:
+                failed.append(str(exc))
+        if failed:
+            self.report({'ERROR'}, '; '.join(failed))
+            return {'CANCELLED'} if not made else {'FINISHED'}
+        self.report({'INFO'}, f'{made} new collider(s); {len(targets)} in total')
+        return {'FINISHED'}
+
+
+class QC_OT_collider_add(Operator):
+    """Add meshes for the cloth to collide with. Selected meshes other than the cloth are added;
+with nothing else selected, an empty row is added for you to pick a mesh in"""
+    bl_idname = 'quick_cloth.collider_add'
+    bl_label = 'Add Collider'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return bool(obj and obj.type == 'MESH' and not is_cage(obj) and editable(obj))
+
+    def execute(self, context):
         p = get_props(context)
-        if p.body is None or p.body == context.active_object:
-            self.report({'ERROR'}, 'Choose a separate mesh body/obstacle')
-            return {'CANCELLED'}
-        try:
-            make_collider(p.body, p.collider_thickness)
-        except ValueError as exc:
-            self.report({'ERROR'}, str(exc))
-            return {'CANCELLED'}
+        present = baking.collision_targets(p)
+        picks = [o for o in context.selected_objects
+                 if o.type == 'MESH' and o != p.id_data and not is_cage(o) and o not in present]
+        for obj in picks or [None]:
+            p.colliders.add().object = obj
+        p.collider_index = len(p.colliders) - 1
+        if picks:
+            self.report({'INFO'}, f'Added {len(picks)} collider(s)')
+        return {'FINISHED'}
+
+
+class QC_OT_collider_remove(Operator):
+    """Take the highlighted mesh off the collider list. Its Collision modifier is kept"""
+    bl_idname = 'quick_cloth.collider_remove'
+    bl_label = 'Remove Collider'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH' or is_cage(obj):
+            return False
+        p = get_props(context)
+        return 0 <= p.collider_index < len(p.colliders)
+
+    def execute(self, context):
+        p = get_props(context)
+        p.colliders.remove(p.collider_index)
+        p.collider_index = min(p.collider_index, len(p.colliders) - 1)
         return {'FINISHED'}
 
 
@@ -1499,7 +1564,8 @@ class QC_OT_diagnose(Operator):
         if not obj or obj.type != 'MESH':
             return {'CANCELLED'}
         errors, warnings = baking.preflight(context, obj, storage=True)
-        warnings += contact_warnings(context, obj, obj.quick_cloth.body)
+        for target in baking.collision_targets(obj.quick_cloth):
+            warnings += contact_warnings(context, obj, target)
         weighted, total = pin_coverage(obj, obj.quick_cloth.pin_group)
         obj.quick_cloth.coverage_text = f'{weighted}/{total} vertices (last inspection)'
         messages = errors + warnings
@@ -2163,18 +2229,24 @@ class QC_PT_collisions(QCStepPanel, Panel):
         layout = self.layout
         layout.enabled = not baking.any_baking()
         props = get_props(context)
-        hint(layout, context, 'Choose what the cloth rests on or wraps around. Only colliders '
-                              'are felt by the cloth.')
+        hint(layout, context, 'Choose what the cloth rests on or wraps around: the main body, '
+                              'plus any other meshes in the list. Only colliders are felt by the cloth.')
         col = layout.column(align=True)
-        col.label(text='Body / Obstacle')
+        col.label(text='Main Body')
         col.prop(props, 'body', text='')
-        body = props.body
-        if body is not None:
-            collider = next((m for m in body.modifiers if m.type == 'COLLISION'), None)
-            if collider and collider.show_viewport and body.collision and body.collision.use:
-                layout.label(text=f'{body.name} is a collider', icon='CHECKMARK')
-            else:
-                layout.operator('quick_cloth.body_collider', icon='MOD_PHYSICS')
+        layout.label(text='More Colliders')
+        row = layout.row()
+        row.template_list('QC_UL_colliders', '', props, 'colliders', props, 'collider_index', rows=3)
+        side = row.column(align=True)
+        side.operator('quick_cloth.collider_add', icon='ADD', text='')
+        side.operator('quick_cloth.collider_remove', icon='REMOVE', text='')
+        targets = baking.collision_targets(props)
+        missing = [o for o in targets if not baking.is_collider(o)]
+        if missing:
+            wrapped(layout, context, f"Not colliders yet: {', '.join(o.name for o in missing)}", icon='ERROR')
+            layout.operator('quick_cloth.body_collider', icon='MOD_PHYSICS')
+        elif targets:
+            layout.label(text=f'{len(targets)} collider(s) ready', icon='CHECKMARK')
         layout.operator("quick_cloth.make_colliders", icon='MESH_ICOSPHERE')
         layout.prop(props, "use_self_collision")
         if props.use_self_collision:
@@ -2189,6 +2261,15 @@ class QC_PT_collisions(QCStepPanel, Panel):
         layout.operator('quick_cloth.diagnose', icon='VIEWZOOM')
         for message in props.diagnostics.splitlines():
             wrapped(layout, context, message, icon='INFO')
+
+
+class QC_UL_colliders(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, 'object', text='', emboss=True)
+        if item.object is not None:
+            ready = baking.is_collider(item.object)
+            row.label(text='', icon='CHECKMARK' if ready else 'ERROR')
 
 
 class QC_PT_collisions_more(QCStepPanel, Panel):
@@ -2370,6 +2451,7 @@ class QCPreferences(AddonPreferences):
 classes = (
     QCPreferences,
     QCSetupRef,
+    QCColliderItem,
     QuickClothProps,
     QC_OT_adopt,
     QC_OT_quality,
@@ -2379,6 +2461,8 @@ classes = (
     QC_OT_make_colliders,
     QC_OT_fit_self_gap,
     QC_OT_body_collider,
+    QC_OT_collider_add,
+    QC_OT_collider_remove,
     QC_OT_remove_wind,
     QC_OT_bake,
     QC_OT_validate_bake,
@@ -2395,6 +2479,7 @@ classes = (
     QC_PT_pins,
     QC_PT_pins_more,
     QC_PT_collisions,
+    QC_UL_colliders,
     QC_PT_collisions_more,
     QC_PT_bake,
     QC_PT_bake_more,

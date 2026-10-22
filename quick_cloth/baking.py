@@ -55,6 +55,20 @@ def check_storage(obj, start, end):
     return str(directory)
 
 
+def is_collider(obj):
+    mod = next((m for m in obj.modifiers if m.type == 'COLLISION'), None)
+    return bool(mod and mod.show_viewport and obj.collision and obj.collision.use)
+
+
+def collision_targets(p):
+    """The main body plus the garment's collider list: unique meshes, never the garment."""
+    targets = []
+    for obj in [p.body] + [item.object for item in p.colliders]:
+        if obj is not None and obj.type == 'MESH' and obj != p.id_data and obj not in targets:
+            targets.append(obj)
+    return targets
+
+
 def preflight(context, obj, storage=False):
     # Poll/draw must remain cheap on production meshes; full checks run in execute.
     errors, warnings = (geometry_issues(obj) if storage else ([], []))
@@ -93,12 +107,13 @@ def preflight(context, obj, storage=False):
         pinned, total = pin_coverage(obj, p.pin_group)
         if total and pinned == total:
             warnings.append('Every vertex has attachment weights; cloth may follow the rig rigidly')
-    if p.body:
-        collider = next((m for m in p.body.modifiers if m.type == 'COLLISION'), None)
-        if not collider or not collider.show_viewport or not p.body.collision.use:
-            warnings.append(f"{p.body.name} isn't a collider yet; press Make Body a Collider in step 3")
-        elif any(m.type == 'ARMATURE' for m in list(p.body.modifiers)[list(p.body.modifiers).index(collider)+1:]):
-            errors.append(f'{p.body.name}: move Collision after Armature deformation')
+    for target in collision_targets(p):
+        modifiers = list(target.modifiers)
+        collider = next((m for m in modifiers if m.type == 'COLLISION'), None)
+        if not is_collider(target):
+            warnings.append(f"{target.name} isn't a collider yet; press Make Them Colliders in step 3")
+        elif any(m.type == 'ARMATURE' for m in modifiers[modifiers.index(collider) + 1:]):
+            errors.append(f'{target.name}: move Collision after Armature deformation')
     # Validate all owned fields before a rebuild can discard the old cache.
     from . import owned_helper
     for helper, kind in ((p.wind, 'WIND'), (p.turbulence, 'TURBULENCE')):
@@ -255,7 +270,8 @@ def signature(scene, obj):
     """Conservative scene signature. External driver inputs need explicit validation."""
     p = obj.quick_cloth
     excluded = {'bake_signature', 'bake_state', 'bake_error', 'bake_metadata', 'bake_needs_validation',
-                'animator_state', 'cage', 'garment', 'show_fabric_detail', 'custom_steps', 'custom_collision', 'diagnostics', 'coverage_text'}
+                'animator_state', 'cage', 'garment', 'show_fabric_detail', 'custom_steps', 'custom_collision', 'diagnostics', 'coverage_text',
+                'collider_index'}
     state = [bpy.app.version_string, rna_values(p, excluded),
              (scene.render.fps, scene.render.fps_base, tuple(scene.gravity), scene.use_gravity, scene.unit_settings.scale_length),
              effective_range(scene, p)]
@@ -298,7 +314,8 @@ def signature(scene, obj):
 
 def settings_signature(p):
     excluded = {'bake_signature', 'bake_state', 'bake_error', 'bake_metadata', 'bake_needs_validation',
-                'animator_state', 'cage', 'garment', 'show_fabric_detail', 'custom_steps', 'custom_collision', 'diagnostics', 'coverage_text'}
+                'animator_state', 'cage', 'garment', 'show_fabric_detail', 'custom_steps', 'custom_collision', 'diagnostics', 'coverage_text',
+                'collider_index'}
     return hashlib.sha256(json.dumps(rna_values(p, excluded), sort_keys=True).encode()).hexdigest()
 
 

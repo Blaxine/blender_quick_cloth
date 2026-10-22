@@ -119,7 +119,7 @@ def contact_warnings(context, obj, body):
     source_points = [source.matrix_world @ v.co for v in source.data.vertices]
     source_tree = BVHTree.FromPolygons(source_points, [tuple(f.vertices) for f in source.data.polygons])
     if source_tree.overlap(tree):
-        return ['Current evaluated cloth/body surfaces overlap; inspect intersections before delivery baking']
+        return [f'The cloth already cuts into {body.name} on this frame; move it clear before baking']
     return []
 
 

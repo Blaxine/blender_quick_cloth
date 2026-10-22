@@ -19,7 +19,7 @@ Open the **Quick Cloth** tab in the 3D Viewport sidebar (N). The box at the top 
 1. Select a mesh. Existing Cloth requires **Adopt Existing Cloth**, which reads live settings without changing the modifier/cache.
 2. **1. Fabric**: choose a fabric starting point. Settings belong to that garment. A fabric resets its listed values, not pressure, gravity, pins or every advanced feature.
 3. **2. Pins**: choose a pin group, or select vertices in Edit Mode and use **Pin Selected Vertices**. New groups are named QC Attachment; an unrelated group named pin is preserved. **Pin From Rig Weights** is an advanced starting point and can pin every vertex: paint weights down where cloth must move freely.
-4. **3. Collisions**: choose a body/obstacle and **Make Body a Collider**, or select obstacles and use **Make Selected Colliders**. Rigged bodies do not need rigid-body physics. Existing collider parameters and collision filters are preserved.
+4. **3. Collisions**: choose the **Main Body**, add any other meshes to **More Colliders** (the + button adds selected meshes, or an empty row to pick one in), then press **Make Them Colliders**. **Make Selected Colliders** still works for obstacles you select in the viewport. Rigged bodies do not need rigid-body physics. Existing collider parameters and collision filters are preserved.
 5. **4. Simulate & Bake**: set the frame range and **Preview / Low / Medium / High / Custom**, then **Set Up Cloth** (later **Update Cloth Settings**). Play sequentially from simulation start for live evaluation.
 6. Use **Check for Problems** for setup/contact diagnostics. **Bake** resolves current settings again. **Re-bake** explicitly replaces an existing cache. **Delete Bake** frees only the selected garment's cache.
 
