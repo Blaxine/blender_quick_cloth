@@ -1,21 +1,12 @@
 """Quality affects numerical fidelity, never fabric or collision policy."""
-from math import ceil
 
-FABRIC_STEPS = {'SIMPLE': 5, 'COTTON': 8, 'POLYESTER': 10, 'COUCH_LEATHER': 15,
-                'LEATHER_COAT': 12, 'LATEX': 14, 'STRETCH_DENIM': 11,
-                'RIGID_DENIM': 12, 'SELVEDGE_DENIM': 14}
+# Fixed (solver steps, collision steps) per tier; the same for every fabric.
+TIERS = {'PREVIEW': (20, 3), 'LOW': (32, 4), 'MEDIUM': (64, 5), 'HIGH': (120, 8)}
 _syncing = set()
 
 
 def resolve(props):
-    base = FABRIC_STEPS.get(props.preset, 12)
-    if props.quality_mode == 'PREVIEW':
-        return max(6, ceil(base / 2)), 3
-    if props.quality_mode == 'MEDIUM':
-        return max(12, base), 5
-    if props.quality_mode == 'HIGH':
-        return max(20, ceil(1.5 * base)), 8
-    return props.quality_steps, props.collision_quality
+    return TIERS.get(props.quality_mode, (props.quality_steps, props.collision_quality))
 
 
 def selection_update(props, context):

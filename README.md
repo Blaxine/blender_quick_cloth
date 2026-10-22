@@ -12,4 +12,6 @@ From the quick_cloth directory, run `python tools/build.py` to create separate e
 
 Run `python tests/run_tests.py --blender "PATH/TO/blender.exe"` for isolated Blender regressions. The test runner supports repeated --blender arguments and writes a versioned results summary.
 
+Open `demo/animator_demo.blend` to try Animator Mode: a walking mannequin with a 13-bone rig wears a cape that is already set up, and the file's READ ME text lists the steps. To rebuild it, run `blender --background --factory-startup --python demo/make_animator_demo.py` from this folder.
+
 License: GPL-3.0-or-later.

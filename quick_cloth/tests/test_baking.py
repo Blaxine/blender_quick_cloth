@@ -20,12 +20,12 @@ assert mod.point_cache.frame_end == 5
 p.quality_mode = 'PREVIEW'
 bpy.context.scene.frame_set(3)
 assert bpy.ops.quick_cloth.bake() == {'FINISHED'}
-assert mod.point_cache.is_baked and mod.settings.quality == 6
+assert mod.point_cache.is_baked and mod.settings.quality == 20
 assert bpy.context.scene.frame_current == 3
 p.quality_mode = 'HIGH'
 assert baking.state(bpy.context, obj) == 'DIRTY'
 assert bpy.ops.quick_cloth.bake(rebuild=True) == {'FINISHED'}
-assert mod.settings.quality == 20
+assert mod.settings.quality == 120
 assert bpy.ops.quick_cloth.free_bake() == {'FINISHED'}
 assert not mod.point_cache.is_baked
 mod.show_viewport = False

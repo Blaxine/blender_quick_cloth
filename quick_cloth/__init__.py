@@ -360,7 +360,7 @@ class QuickClothProps(PropertyGroup):
     bake_error: StringProperty()
     bake_metadata: StringProperty()
     bake_needs_validation: BoolProperty(default=False)
-    custom_steps: IntProperty(default=12, min=1, max=80)
+    custom_steps: IntProperty(default=64, min=1, max=1000)
     custom_collision: IntProperty(default=5, min=1, max=20)
     dynamic_mesh: BoolProperty(
         name='Squash & Stretch Rig',
@@ -605,11 +605,12 @@ class QuickClothProps(PropertyGroup):
         name='Quality',
         description='How carefully the solver works. Changes speed and '
                     'accuracy only, never how the fabric behaves',
-        items=[('PREVIEW', 'Preview', 'Fast and rough: check timing and broad motion', 0),
+        items=[('PREVIEW', 'Preview', '20 steps per frame: fast, for checking timing and broad motion', 0),
+               ('LOW', 'Low', '32 steps per frame: quick drafts', 5),
                ('FINAL', 'Legacy Final', 'Values kept from an older Quick Cloth version', 1),
-               ('MEDIUM', 'Medium', 'Balanced: good for most shots', 2),
-               ('HIGH', 'High', 'Slow and careful: fast motion and tight contact', 3),
-               ('CUSTOM', 'Custom', 'Your own solver and collision steps', 4)],
+               ('MEDIUM', 'Medium', '64 steps per frame: good for most shots', 2),
+               ('HIGH', 'High', '120 steps per frame: slow; fast motion and tight contact', 3),
+               ('CUSTOM', 'Custom', 'Your own number of steps per frame', 4)],
         default='MEDIUM', update=quality_update,
     )
     frame_start: IntProperty(
@@ -641,7 +642,7 @@ class QuickClothProps(PropertyGroup):
         description="Calculation steps per frame. More is slower but more "
                     "stable; too few makes stretchy, unstable cloth. Editing "
                     "this switches Quality to Custom",
-        default=12, min=1, max=80, update=quality_values_update,
+        default=64, min=1, max=1000, soft_max=300, update=quality_values_update,
     )
     collision_quality: IntProperty(
         name="Collision Steps",
@@ -1025,7 +1026,7 @@ class QC_OT_quality(Operator):
     tier: StringProperty()
 
     def execute(self, context):
-        if self.tier not in {'PREVIEW', 'MEDIUM', 'HIGH', 'CUSTOM'}:
+        if self.tier not in {'PREVIEW', 'LOW', 'MEDIUM', 'HIGH', 'CUSTOM'}:
             return {'CANCELLED'}
         if baking.any_baking():
             self.report({'ERROR'}, 'Wait for the running bake before changing quality')
@@ -1913,10 +1914,11 @@ PRESET_HINTS = {
 }
 
 QUALITY_HINTS = {
-    'PREVIEW': 'Fast and rough: for checking timing.',
-    'MEDIUM': 'Balanced: good for most shots.',
-    'HIGH': 'Slow and careful: fast motion, tight contact.',
-    'CUSTOM': 'Your own steps, set in More Simulation Options.',
+    'PREVIEW': '20 steps per frame. Fast: for checking timing.',
+    'LOW': '32 steps per frame. Quick drafts.',
+    'MEDIUM': '64 steps per frame. Good for most shots.',
+    'HIGH': '120 steps per frame. Slow: fast motion, tight contact.',
+    'CUSTOM': 'Type any number of steps per frame. More is smoother and slower.',
     'FINAL': 'Values kept from an older Quick Cloth version.',
 }
 
@@ -2232,10 +2234,13 @@ class QC_PT_bake(QCStepPanel, Panel):
             wrapped(layout, context, str(exc), icon='ERROR')
 
         layout.label(text="Quality")
-        row = layout.row(align=True)
-        for tier in ('PREVIEW', 'MEDIUM', 'HIGH', 'CUSTOM'):
-            op = row.operator('quick_cloth.quality', text=tier.title(), depress=props.quality_mode == tier)
+        # Five tiers don't fit one row in the default sidebar width.
+        grid = layout.grid_flow(row_major=True, columns=3, even_columns=True, align=True)
+        for tier in ('PREVIEW', 'LOW', 'MEDIUM', 'HIGH', 'CUSTOM'):
+            op = grid.operator('quick_cloth.quality', text=tier.title(), depress=props.quality_mode == tier)
             op.tier = tier
+        if props.quality_mode == 'CUSTOM':
+            layout.prop(props, 'quality_steps', text='Steps per Frame')
         wrapped(layout, context, QUALITY_HINTS.get(props.quality_mode, ''))
 
         mod = baking.cloth(obj)

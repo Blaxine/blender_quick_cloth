@@ -20,12 +20,12 @@ Open the **Quick Cloth** tab in the 3D Viewport sidebar (N). The box at the top 
 2. **1. Fabric**: choose a fabric starting point. Settings belong to that garment. A fabric resets its listed values, not pressure, gravity, pins or every advanced feature.
 3. **2. Pins**: choose a pin group, or select vertices in Edit Mode and use **Pin Selected Vertices**. New groups are named QC Attachment; an unrelated group named pin is preserved. **Pin From Rig Weights** is an advanced starting point and can pin every vertex: paint weights down where cloth must move freely.
 4. **3. Collisions**: choose a body/obstacle and **Make Body a Collider**, or select obstacles and use **Make Selected Colliders**. Rigged bodies do not need rigid-body physics. Existing collider parameters and collision filters are preserved.
-5. **4. Simulate & Bake**: set the frame range and **Preview / Medium / High / Custom**, then **Set Up Cloth** (later **Update Cloth Settings**). Play sequentially from simulation start for live evaluation.
+5. **4. Simulate & Bake**: set the frame range and **Preview / Low / Medium / High / Custom**, then **Set Up Cloth** (later **Update Cloth Settings**). Play sequentially from simulation start for live evaluation.
 6. Use **Check for Problems** for setup/contact diagnostics. **Bake** resolves current settings again. **Re-bake** explicitly replaces an existing cache. **Delete Bake** frees only the selected garment's cache.
 
 ## Quality and fabric
 
-Medium is the default. Preview reduces solver work without silently disabling self-collision. High raises solver steps and collision iterations. Custom stores edited values and restores them after visiting other tiers. Effective numerical settings are visible.
+Quality sets solver steps per frame, the same for every fabric: Preview 20, Low 32, Medium 64 (the default), High 120. Collision steps are 3, 4, 5 and 8. Custom takes any number of steps, typed right under the quality buttons, and restores your values after visiting other tiers. No tier disables self-collision.
 
 Quality does not alter physical mass, stiffness, damping, distances, pressure, time scale or attachments. Fabric selection can change its own prescribed values. Positive Shrink / Grow shrinks and negative grows. Adopted legacy shrink values retain their actual behavior; selecting a new fabric applies corrected preset signs.
 
