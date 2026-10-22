@@ -10,22 +10,24 @@ This build implements the eight REQ-001 development slices. **Commercial release
 - Blender 4.1: use `dist/quick_cloth-1.1.0-legacy.zip` through legacy add-on installation.
 - Restart Blender when replacing an earlier development build. Back up production .blend files before adopting/migrating existing setups.
 
-Run `python tools/build.py` to make both archives. Packaging uses an explicit allowlist; tests, audit files and local caches are not distributed. Registration and actual simulation tests run on 4.1.1 and 5.1.2; 4.2/4.5 and interactive extension installation still require verification.
+Run `python tools/build.py` to make both archives. Packaging uses an explicit allowlist; tests, audit files and local caches are not distributed. Registration and actual simulation tests last ran on 4.5.4 LTS and 5.2.2 LTS (earlier builds on 4.1.1 and 5.1.2); 4.2 and interactive extension installation still require verification.
 
 ## Workflow
 
+Open the **Quick Cloth** tab in the 3D Viewport sidebar (N). The box at the top says what the selected mesh needs next; the numbered sections follow the setup order. Short help text appears under each section; hide it with the **?** button in the panel header (saved in the add-on preferences). Rarely changed settings are in the closed **More …** sections.
+
 1. Select a mesh. Existing Cloth requires **Adopt Existing Cloth**, which reads live settings without changing the modifier/cache.
-2. Choose a fabric starting point. Settings belong to that garment. Presets reset their listed fabric values, not pressure, gravity, attachments or every advanced feature.
-3. For attachments, choose a vertex group or select vertices in Edit Mode and use **Set Pin Group**. New groups are named QC Attachment; an unrelated group named pin is preserved. Automatic rig-weight pinning is an advanced starting point and can pin every vertex: paint weights down where cloth must move freely.
-4. Choose a body/obstacle and **Make Body Collider**, or select obstacles and use **Make Collider(s)**. Rigged bodies do not need rigid-body physics. Existing collider parameters and collision filters are preserved.
-5. Choose **Preview / Medium / High / Custom** and an exact range, then **Simulate Cloth!** to configure. Play sequentially from simulation start for live evaluation.
-6. Inspect the setup/contact diagnostics. **Bake** resolves current settings again. **Rebuild Bake** explicitly replaces an existing cache. **Free Bake** frees only the selected garment's cache.
+2. **1. Fabric**: choose a fabric starting point. Settings belong to that garment. A fabric resets its listed values, not pressure, gravity, pins or every advanced feature.
+3. **2. Pins**: choose a pin group, or select vertices in Edit Mode and use **Pin Selected Vertices**. New groups are named QC Attachment; an unrelated group named pin is preserved. **Pin From Rig Weights** is an advanced starting point and can pin every vertex: paint weights down where cloth must move freely.
+4. **3. Collisions**: choose a body/obstacle and **Make Body a Collider**, or select obstacles and use **Make Selected Colliders**. Rigged bodies do not need rigid-body physics. Existing collider parameters and collision filters are preserved.
+5. **4. Simulate & Bake**: set the frame range and **Preview / Medium / High / Custom**, then **Set Up Cloth** (later **Update Cloth Settings**). Play sequentially from simulation start for live evaluation.
+6. Use **Check for Problems** for setup/contact diagnostics. **Bake** resolves current settings again. **Re-bake** explicitly replaces an existing cache. **Delete Bake** frees only the selected garment's cache.
 
 ## Quality and fabric
 
 Medium is the default. Preview reduces solver work without silently disabling self-collision. High raises solver steps and collision iterations. Custom stores edited values and restores them after visiting other tiers. Effective numerical settings are visible.
 
-Quality does not alter physical mass, stiffness, damping, distances, pressure, time scale or attachments. Fabric selection can change its own prescribed values. Positive Fit Tightness shrinks and negative grows. Adopted legacy shrink values retain their actual behavior; selecting a new fabric applies corrected preset signs.
+Quality does not alter physical mass, stiffness, damping, distances, pressure, time scale or attachments. Fabric selection can change its own prescribed values. Positive Shrink / Grow shrinks and negative grows. Adopted legacy shrink values retain their actual behavior; selecting a new fabric applies corrected preset signs.
 
 ## Baking and storage
 
@@ -33,16 +35,16 @@ Quality does not alter physical mass, stiffness, damping, distances, pressure, t
 - The requested end frame is respected, independent of the scene's end. Baking restores the playhead.
 - Disk cache requires a saved .blend and writable storage. Native caches are stored in the displayed `blendcache_<filename>` directory beside that file. Keep the cache folder with the project and revalidate after Save As/moving files.
 - Preview bakes are diagnostic, not certified final quality.
-- Existing bakes are retained when settings change and shown as Dirty/Needs Validation. Validate Cache Dependencies compares recorded inputs; scene evaluation and reload conservatively request validation. External driver inputs and visual correctness still require review.
+- Existing bakes are retained when settings change and shown as out of date or needing a check. **Check Bake** compares recorded inputs; scene evaluation and reload conservatively request validation. External driver inputs and visual correctness still require review.
 - Interactive native bake progress/Escape integration is implemented but awaits interactive acceptance. No dedicated pause/resume promise is made.
 
 ## Animator Mode and render proxies
 
-Animator Mode requires configured cloth. It mutes the cloth in the viewport and creates a non-rendering stand-in. Re-entry rebuilds the stand-in to pick up geometry/rig changes. Exit restores recorded visibility and retains old caches for explicit validation/rebuild. Recover Hidden Garment can restore a single hidden setup even if its cage was deleted.
+Animator Mode requires configured cloth. It mutes the cloth in the viewport and creates a non-rendering stand-in. Re-entry rebuilds the stand-in to pick up geometry/rig changes. Exit restores recorded visibility and retains old caches for explicit validation/rebuild. **Recover Hidden Cloth** (in the Animator Mode section) can restore a single hidden setup even if its cage was deleted.
 
 Cage decimation occurs after copied deformation: this mode avoids cloth solving but is **not a measured low-poly rig optimization**. Render meshes driven by Surface Deform must not also carry Armature/Cloth; put those on the simulation proxy. Bind at simulation start. Bind, Rebind and Unbind are explicit operations and preserve unrelated Surface Deform modifiers.
 
-Create Static Snapshot captures the full evaluated mesh stack into a new object. It does not produce a shape key or an animated export.
+**Freeze Frame as New Object** captures the full evaluated mesh stack into a new object. It does not produce a shape key or an animated export.
 
 ## Supported boundaries
 

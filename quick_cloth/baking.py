@@ -68,7 +68,7 @@ def preflight(context, obj, storage=False):
     if not p.setup_id or p.garment:
         errors.append('Select a configured garment, not an animation cage')
     if p.owner != obj or not any(e.uid == p.setup_id and e.owner == obj for e in context.scene.quick_cloth_registry):
-        errors.append('Duplicated/uninitialized setup identity: run Simulate Cloth to initialize this garment')
+        errors.append('Duplicated/uninitialized setup identity: press Set Up Cloth to initialize this garment')
     if len(obj.users_scene) > 1:
         errors.append('Garment is shared between scenes; make a single-scene object copy before baking')
     if mod is None:
@@ -96,7 +96,7 @@ def preflight(context, obj, storage=False):
     if p.body:
         collider = next((m for m in p.body.modifiers if m.type == 'COLLISION'), None)
         if not collider or not collider.show_viewport or not p.body.collision.use:
-            warnings.append(f'{p.body.name}: intended body has no enabled collision')
+            warnings.append(f"{p.body.name} isn't a collider yet; press Make Body a Collider in step 3")
         elif any(m.type == 'ARMATURE' for m in list(p.body.modifiers)[list(p.body.modifiers).index(collider)+1:]):
             errors.append(f'{p.body.name}: move Collision after Armature deformation')
     # Validate all owned fields before a rebuild can discard the old cache.

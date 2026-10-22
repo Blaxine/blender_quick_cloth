@@ -21,6 +21,7 @@ bl_info = {
 import bpy
 import uuid
 import json
+import textwrap
 from datetime import datetime, timezone
 from . import baking
 from bpy.props import (
@@ -33,7 +34,7 @@ from bpy.props import (
     PointerProperty,
     StringProperty,
 )
-from bpy.types import Operator, Panel, PropertyGroup
+from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
 from mathutils import Vector
 from .validation import geometry_issues, pin_coverage, validate_pin_edit, depends_on, editable, contact_warnings
 from .quality import resolve as resolve_quality, selection_update as quality_update, values_update as quality_values_update
@@ -341,7 +342,12 @@ class QuickClothProps(PropertyGroup):
     setup_id: StringProperty()
     owner: PointerProperty(type=bpy.types.Object)
     data_version: IntProperty(default=0)
-    pin_group: StringProperty(name="Attachment Group")
+    pin_group: StringProperty(
+        name="Pin Group",
+        description="Vertex group holding the pinned vertices. Pinned vertices "
+                    "stick to the object or its rig; weight 1 holds fully, "
+                    "lower weights hold loosely, 0 moves freely",
+    )
     cage: PointerProperty(type=bpy.types.Object)
     garment: PointerProperty(type=bpy.types.Object)
     wind: PointerProperty(type=bpy.types.Object)
@@ -355,25 +361,47 @@ class QuickClothProps(PropertyGroup):
     bake_needs_validation: BoolProperty(default=False)
     custom_steps: IntProperty(default=12, min=1, max=80)
     custom_collision: IntProperty(default=5, min=1, max=20)
-    dynamic_mesh: BoolProperty(name='Dynamic Rest Shape', default=False,
-                              description='Recompute rest shape for squash/stretch rigs; not required for normal pinned cloth')
-    use_object_collision: BoolProperty(name='Enable Cloth Collisions', default=True)
-    body: PointerProperty(name='Body / Obstacle', type=bpy.types.Object,
-                          poll=lambda self, obj: obj.type == 'MESH')
+    dynamic_mesh: BoolProperty(
+        name='Squash & Stretch Rig',
+        description='Turn on only if the rig squashes or stretches the garment: '
+                    'the cloth then updates its resting shape every frame. '
+                    'Normal pinned clothing does not need this',
+        default=False)
+    use_object_collision: BoolProperty(
+        name='Collide With Objects',
+        description='Let the cloth hit colliders (bodies, floors, furniture). '
+                    'Turn off only for cloth that should pass through everything',
+        default=True)
+    body: PointerProperty(
+        name='Body / Obstacle', type=bpy.types.Object,
+        description='The character or object this cloth rests on or wraps around',
+        poll=lambda self, obj: obj.type == 'MESH')
     binding_name: StringProperty()
     binding_target: PointerProperty(type=bpy.types.Object)
     diagnostics: StringProperty()
     coverage_text: StringProperty(default='Not inspected')
-    collider_thickness: FloatProperty(name='New Collider Thickness', default=.005, min=.001, max=1, unit='LENGTH')
-    impulse_clamp: FloatProperty(name='Collision Impulse Clamp', default=0, min=0, max=10000)
-    self_impulse_clamp: FloatProperty(name='Self Impulse Clamp', default=0, min=0, max=10000)
+    collider_thickness: FloatProperty(
+        name='New Collider Padding',
+        description='Invisible padding added around objects that Quick Cloth '
+                    'turns into colliders. Existing colliders keep their own value',
+        default=.005, min=.001, max=1, unit='LENGTH')
+    impulse_clamp: FloatProperty(
+        name='Collision Impulse Limit',
+        description='Caps how hard a collision can push the cloth. Try 1–5 if '
+                    'the cloth explodes or jitters on contact; 0 means no limit',
+        default=0, min=0, max=10000)
+    self_impulse_clamp: FloatProperty(
+        name='Self-Collision Impulse Limit',
+        description='Caps how hard the cloth can push against itself. Try 1–5 '
+                    'if folds jitter; 0 means no limit',
+        default=0, min=0, max=10000)
 
     preset: EnumProperty(
-        name="Fabric Preset",
-        description="One-click fabric starting point. Selecting a preset "
-                    "rewrites every physics value below (and updates a live "
-                    "cloth modifier immediately) — then every slider stays "
-                    "fully editable",
+        name="Fabric",
+        description="What the cloth is made of. Choosing a fabric fills in its "
+                    "weight, stiffness, damping, collision gaps, self-collision, "
+                    "shrink, seam and volume settings (pins, pressure, wind and gravity are left alone). "
+                    "Every value stays editable afterwards",
         items=PRESET_ITEMS,
         default="SIMPLE",
         update=apply_preset,
@@ -381,224 +409,210 @@ class QuickClothProps(PropertyGroup):
 
     # --- Fabric physics -----------------------------------------------------
     mass: FloatProperty(
-        name="Vertex Mass",
-        description="Mass per vertex in kilograms. Heavier fabric hangs "
-                    "straighter and resists wind. Nominal — the visual weight "
-                    "also depends on mesh density, so treat this as a feel "
-                    "dial, not a scale reading",
+        name="Weight",
+        description="Weight of each vertex. Heavier cloth hangs straighter and "
+                    "resists wind. Denser meshes are heavier overall, so treat "
+                    "this as a feel dial",
         default=0.30, min=0.001, max=10.0, unit='MASS',
     )
     tension_stiffness: FloatProperty(
-        name="Tension",
-        description="Resistance to being stretched. High values keep edge "
-                    "lengths fixed (denim, leather); low values let the "
-                    "fabric elongate (latex, jersey)",
+        name="Stretch",
+        description="How much the cloth resists being pulled longer. High for "
+                    "denim and leather, low for latex and jersey",
         default=15.0, min=0.0, max=10000.0,
     )
     compression_stiffness: FloatProperty(
-        name="Compression",
-        description="Resistance to being squashed along its surface. Low "
-                    "values buckle into fine wrinkles; high values push back "
-                    "into large folds",
+        name="Squash",
+        description="How much the cloth resists being pushed shorter. Low "
+                    "values make fine wrinkles; high values make big folds",
         default=15.0, min=0.0, max=10000.0,
     )
     shear_stiffness: FloatProperty(
         name="Shear",
-        description="Resistance to diagonal distortion (a square becoming a "
-                    "rhombus). Woven fabrics shear less than knits",
+        description="How much the cloth resists skewing diagonally (a square "
+                    "becoming a diamond). Woven fabric skews less than knits",
         default=5.0, min=0.0, max=10000.0,
     )
     bending_stiffness: FloatProperty(
-        name="Bending",
-        description="Resistance to folding out of plane. THE fabric-character "
-                    "dial: near zero = silk/latex follows every curve, high = "
-                    "leather/cardboard makes few big folds",
+        name="Bend",
+        description="How much the cloth resists folding. The main fabric dial: "
+                    "near 0 follows every curve like silk, high makes few big "
+                    "folds like leather",
         default=0.5, min=0.0, max=10000.0,
     )
     tension_damping: FloatProperty(
-        name="Tension Damping",
-        description="How fast stretch oscillations die out. Higher = less "
-                    "springy, more settled motion",
+        name="Stretch Damping",
+        description="How quickly stretch bounces settle. Higher is calmer and "
+                    "less springy",
         default=5.0, min=0.0, max=50.0,
     )
     compression_damping: FloatProperty(
-        name="Compression Damping",
-        description="How fast squash oscillations die out",
+        name="Squash Damping",
+        description="How quickly squash bounces settle",
         default=5.0, min=0.0, max=50.0,
     )
     shear_damping: FloatProperty(
         name="Shear Damping",
-        description="How fast diagonal jiggle dies out",
+        description="How quickly diagonal jiggle settles",
         default=5.0, min=0.0, max=50.0,
     )
     bending_damping: FloatProperty(
-        name="Bending Damping",
-        description="How fast flapping and fold oscillation dies out. High "
-                    "values make creases read as 'held' (selvedge denim)",
+        name="Bend Damping",
+        description="How quickly flapping and folds settle. High values make "
+                    "creases look held in place",
         default=0.5, min=0.0, max=1000.0,
     )
     air_damping: FloatProperty(
-        name="Air Damping",
-        description="Air resistance. Higher values make fabric floaty and "
-                    "slow-falling (polyester); lower values let it drop fast",
+        name="Air Resistance",
+        description="How much the air slows the cloth. Higher floats and falls "
+                    "slowly; lower drops fast",
         default=1.0, min=0.0, max=10.0,
     )
     time_scale: FloatProperty(
-        name="Time Scale",
-        description="Simulation speed multiplier. Below 1.0 reads as heavier/"
-                    "slower fabric. Use this instead of changing scene FPS — "
-                    "bakes are FPS-dependent",
+        name="Speed",
+        description="Plays the cloth faster or slower. Below 1 reads as "
+                    "heavier, slower fabric. Use this instead of changing the "
+                    "scene frame rate",
         default=1.0, min=0.01, max=10.0,
     )
+    # Retained for saved files; the panel now uses a collapsible sub-panel.
     show_fabric_detail: BoolProperty(
         name="Fabric Detail",
         description="Show the individual stiffness and damping sliders",
         default=False,
     )
     use_internal_springs: BoolProperty(
-        name="Internal Springs",
-        description="Add volume-preserving springs through the cloth's "
-                    "thickness. Used by the Couch Leather preset so cushions "
-                    "keep their bulk",
+        name="Keep Volume",
+        description="Adds springs through the inside of closed shapes so "
+                    "cushions and thick hide keep their bulk. Used by Couch Leather",
         default=False,
     )
     internal_stiffness: FloatProperty(
-        name="Internal Stiffness",
-        description="Stiffness of the internal volume springs",
+        name="Volume Stiffness",
+        description="How firmly the inside springs hold the shape",
         default=5.0, min=0.0, max=10000.0,
     )
 
     # --- Garment ------------------------------------------------------------
     pin_stiffness: FloatProperty(
-        name="Pin Stiffness",
-        description="Target stiffness for weighted attachment vertices. Higher values resist lag; "
-                    "weights and solver quality also affect attachment. Pinned vertices "
-                    "stretch. Pinned vertices follow the object's own "
-                    "animation — animate or rig the object to drag a cape "
-                    "around",
+        name="Pin Strength",
+        description="How firmly pinned vertices hold. Higher values lag less "
+                    "behind the object or rig. Animate or rig the object to "
+                    "move the pinned parts",
         default=1.0, min=0.0, max=50.0,
     )
     fit_tightness: FloatProperty(
-        name="Fit Tightness",
-        description="Positive values shrink cloth; negative values grow it. "
-                    "Needs a body collider for a tight fit. Existing adopted values are preserved",
+        name="Shrink / Grow",
+        description="Positive values shrink the cloth to hug a body (add a "
+                    "body collider); negative values grow it looser",
         default=0.0, min=-0.3, max=0.3,
     )
     use_sewing: BoolProperty(
-        name="Use Sewing",
-        description="Pull sewing-spring edges together — for garments "
-                    "modeled as flat panels joined by loose edges (marvelous-"
-                    "designer style). The Latex preset enables this",
+        name="Sew Seams",
+        description="Pulls loose edges together, for garments modeled as flat "
+                    "panels joined by loose seam edges. The Latex fabric uses this",
         default=False,
     )
     sewing_force: FloatProperty(
         name="Sewing Force",
-        description="Maximum force pulling sewing edges together",
+        description="How hard the seam edges are pulled together",
         default=0.5, min=0.0, max=10000.0,
     )
     use_pressure: BoolProperty(
-        name="Pressure",
-        description="Inflate the cloth with internal pressure — puffer "
-                    "jackets, balloons, inflatables",
+        name="Inflate",
+        description="Fills a closed shape with air pressure: puffer jackets, "
+                    "pillows, balloons",
         default=False,
     )
     pressure_force: FloatProperty(
-        name="Pressure Force",
-        description="Uniform internal pressure. Positive inflates, negative "
-                    "deflates",
+        name="Pressure",
+        description="Positive inflates, negative deflates",
         default=1.0, min=-10000.0, max=10000.0,
     )
     pressure_target_volume: FloatProperty(
         name="Target Volume",
-        description="Volume the pressure tries to maintain (0 = disabled, "
-                    "use raw force only)",
+        description="Volume the pressure tries to keep. 0 uses the pressure "
+                    "value alone",
         default=0.0, min=0.0, max=10000.0,
     )
 
     # --- Forces -------------------------------------------------------------
     use_wind: BoolProperty(
         name="Add Wind",
-        description="On Simulate, create (or reuse) the QC_Wind force-field "
-                    "rig: a Wind empty aimed along the direction below plus a "
-                    "parented Turbulence field for gusts",
+        description="Adds a wind field (with gusts) that blows the cloth. It "
+                    "is created when you press Set Up Cloth",
         default=False, update=wind_enabled_update,
     )
     wind_direction: FloatVectorProperty(
         name="Direction",
-        description="World-space direction the wind blows toward",
+        description="World direction the wind blows toward",
         default=(1.0, 0.0, 0.0), subtype='XYZ', size=3,
     )
     wind_strength: FloatProperty(
         name="Strength",
-        description="Wind force-field strength",
+        description="How strong the steady wind is",
         default=1000.0, min=0.0, max=100000.0,
     )
     wind_turbulence: FloatProperty(
-        name="Turbulence",
-        description="Strength of the gust/noise field parented to the wind. "
-                    "0 = perfectly steady wind",
+        name="Gusts",
+        description="How strong the random gusts are. 0 is perfectly steady wind",
         default=250.0, min=0.0, max=100000.0,
     )
     wind_seed: IntProperty(
-        name="Wind Seed",
-        description="Random seed for the turbulence noise. Re-roll it for a "
-                    "different gust pattern without changing the wind's "
-                    "average behavior — same idea as Quick Break's Break/"
-                    "Shrapnel seeds",
+        name="Gust Pattern",
+        description="Change this number for a different gust pattern with the "
+                    "same overall strength",
         default=0, min=0, max=10000,
     )
     gravity_influence: FloatProperty(
-        name="Gravity Influence",
-        description="How much scene gravity affects this cloth (0–1). Lower "
-                    "it to float heavy fabrics for stylized shots",
+        name="Gravity",
+        description="How much gravity pulls this cloth (0–1). Lower it to make "
+                    "fabric float for stylized shots",
         default=1.0, min=0.0, max=1.0, subtype='FACTOR',
     )
 
     # --- Collisions ---------------------------------------------------------
     use_collision_objects: BoolProperty(
-        name="Auto-convert Rigid Bodies",
-        description="On Simulate, automatically give a Collision modifier to "
-                    "every rigid-body mesh in the scene that lacks one, so "
-                    "obstacles just work. Each object is converted "
-                    "individually — no collision collection is ever created; "
-                    "the cloth collides with everything in the scene",
+        name="Auto Colliders for Rigid Bodies",
+        description="When you press Set Up Cloth or Bake, any rigid-body mesh "
+                    "in the scene without a collider gets one, so physics "
+                    "props just work. Turn off to leave other objects untouched",
         default=True,
     )
     object_distance: FloatProperty(
-        name="Object Distance",
-        description="Minimum distance kept between the cloth and collision "
-                    "objects. Raise it if the cloth pokes through obstacles",
+        name="Gap to Obstacles",
+        description="Space the cloth keeps from colliders. Raise it if the "
+                    "cloth pokes through; lower it if it floats above the body",
         default=0.015, min=0.001, max=1.0, unit='LENGTH',
     )
     use_self_collision: BoolProperty(
-        name="Self Collision",
-        description="Stop the cloth passing through itself. Required for "
-                    "skin-tight fits and layered folds; costs solve time",
+        name="Collide With Itself",
+        description="Stops the cloth passing through itself. Needed for tight "
+                    "fits and layered folds; makes the simulation slower",
         default=False,
     )
     self_distance: FloatProperty(
-        name="Self Distance",
-        description="Minimum distance the cloth keeps from itself. Too large "
-                    "= puffy; too small = misses collisions and explodes",
+        name="Gap to Itself",
+        description="Space the cloth keeps from itself. Too large looks puffy; "
+                    "too small can miss contacts and explode",
         default=0.015, min=0.001, max=0.1, unit='LENGTH',
     )
 
     # --- Simulation ---------------------------------------------------------
     quality_mode: EnumProperty(
-        name='Simulation Quality',
-        description='Numerical solver quality; physical fabric settings and collision policy stay unchanged',
-        items=[('PREVIEW', 'Preview', 'Timing and broad motion', 0),
-               ('FINAL', 'Legacy Final', 'Preserved legacy authored values', 1),
-               ('MEDIUM', 'Medium', 'Balanced iteration', 2),
-               ('HIGH', 'High', 'Tight contact and faster motion', 3),
-               ('CUSTOM', 'Custom', 'Explicit authored steps and iterations', 4)],
+        name='Quality',
+        description='How carefully the solver works. Changes speed and '
+                    'accuracy only, never how the fabric behaves',
+        items=[('PREVIEW', 'Preview', 'Fast and rough: check timing and broad motion', 0),
+               ('FINAL', 'Legacy Final', 'Values kept from an older Quick Cloth version', 1),
+               ('MEDIUM', 'Medium', 'Balanced: good for most shots', 2),
+               ('HIGH', 'High', 'Slow and careful: fast motion and tight contact', 3),
+               ('CUSTOM', 'Custom', 'Your own solver and collision steps', 4)],
         default='MEDIUM', update=quality_update,
     )
     frame_start: IntProperty(
         name="Start Frame",
-        description="First frame of the SHOT. The simulation itself starts "
-                    "Settle Frames earlier so the garment is already draped "
-                    "here",
+        description="First frame of the shot",
         default=1,
     )
     frame_end: IntProperty(
@@ -608,48 +622,45 @@ class QuickClothProps(PropertyGroup):
     )
     settle_frames: IntProperty(
         name="Settle Frames",
-        description="Pre-roll: the simulation starts this many frames BEFORE "
-                    "the shot's start frame so the garment is already draped "
-                    "when the shot begins. The scene start frame is extended "
-                    "down automatically if needed (the cache must always be "
-                    "reachable on the timeline). Animate the character "
-                    "holding its first pose during the settle window",
+        description="Starts the simulation this many frames before the shot so "
+                    "the cloth is already draped when the shot begins. The "
+                    "shot start must be at least this many frames; nothing is "
+                    "retimed. Hold the character still during these frames",
         default=0, min=0, max=120,
     )
     use_preview_range: BoolProperty(
-        name="Use Preview Range",
-        description="When the timeline's preview range is active, take the "
-                    "shot start/end from it instead of the fields above",
+        name="Use Timeline Preview Range",
+        description="When the timeline's preview range is on, simulate that "
+                    "range instead of the Start/End frames above",
         default=False,
     )
     quality_steps: IntProperty(
-        name="Quality Steps",
-        description="Simulation substeps per frame. The main speed/accuracy "
-                    "dial: scale it down for viewport previews, up for final "
-                    "bakes. Too low = stretchy, unstable cloth",
+        name="Solver Steps",
+        description="Calculation steps per frame. More is slower but more "
+                    "stable; too few makes stretchy, unstable cloth. Editing "
+                    "this switches Quality to Custom",
         default=12, min=1, max=80, update=quality_values_update,
     )
     collision_quality: IntProperty(
-        name="Collision Quality",
-        description="Collision solver iterations. Raise it if fast-moving "
-                    "cloth tunnels through obstacles",
+        name="Collision Steps",
+        description="Collision checks per step. Raise it if fast cloth passes "
+                    "through obstacles. Editing this switches Quality to Custom",
         default=5, min=1, max=20, update=quality_values_update,
     )
     use_disk_cache: BoolProperty(
-        name="Disk Cache",
-        description="Store the bake on disk next to the .blend (library-path "
-                    "aware) so it survives file relinking and render farms",
+        name="Save Bake to Disk",
+        description="Store the bake in a blendcache folder next to the saved "
+                    ".blend instead of inside it. Needs a saved file; keep the "
+                    "folder with the project when moving it",
         default=False,
     )
 
     # --- Animator Mode --------------------------------------------------
     cage_ratio: FloatProperty(
-        name="Cage Detail",
-        description="Polygon ratio of the animation cage relative to the "
-                    "garment (0.05 = 5% of the faces). The cage is a "
-                    "decimated stand-in that follows the same rig with the "
-                    "cloth sim fully muted — no solving, no cache RAM — so "
-                    "playback stays fast while you animate",
+        name="Stand-in Detail",
+        description="How detailed the Animator Mode stand-in is compared with "
+                    "the cloth (0.2 = 20% of the faces). It follows the rig "
+                    "without solving cloth, so playback stays fast",
         default=0.2, min=0.02, max=1.0, subtype='FACTOR',
     )
 
@@ -886,7 +897,7 @@ def remove_wind_rig(context):
 
 def cache_hygiene(context, scene, cache, sim_start, sim_end, report=None):
     if cache.is_baked or cache.is_baking:
-        raise ValueError('Existing baked/running cache: use Rebuild Bake or Free Bake first')
+        raise ValueError('Existing baked/running cache: use Re-bake or Delete Bake first')
     if sim_start < 0 or sim_end < max(1, sim_start):
         raise ValueError('Invalid simulation range; negative pre-roll is not supported')
     cache.frame_start = sim_start
@@ -1005,6 +1016,7 @@ def initialize_setup(obj, scene, adopt=False):
 
 
 class QC_OT_quality(Operator):
+    """Choose how carefully the cloth is solved: faster and rougher, or slower and more accurate"""
     bl_idname = 'quick_cloth.quality'
     bl_label = 'Set Simulation Quality'
     bl_options = {'REGISTER', 'UNDO'}
@@ -1021,9 +1033,9 @@ class QC_OT_quality(Operator):
 
 
 class QC_OT_adopt(Operator):
-    """Adopt existing cloth without changing its modifier or baked result"""
+    """Manage this mesh's existing cloth with Quick Cloth. Its settings and any bake stay exactly as they are"""
     bl_idname = 'quick_cloth.adopt'
-    bl_label = 'Adopt Cloth / Initialize Copy'
+    bl_label = 'Adopt Existing Cloth'
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1115,13 +1127,11 @@ def build_or_update_cage(context, garment, ratio):
 # ---------------------------------------------------------------------------
 
 class QC_OT_simulate(Operator):
-    """Set up (or refresh) the cloth simulation on the active mesh:
-configure the Cloth modifier from the panel values, fix the Armature/Cloth
-stack order, auto-convert rigid-body obstacles into colliders, build the
-owned wind rig, and validate the exact simulation range.
-Existing baked caches require explicit Rebuild Bake"""
+    """Turn the selected mesh into cloth using the panel settings, or apply changed settings.
+Also hooks up pins, places the cloth after the rig, adds wind if enabled and sets the frame range.
+Press Play afterwards to preview. A baked cloth is updated with Re-bake instead"""
     bl_idname = "quick_cloth.simulate"
-    bl_label = "Simulate Cloth!"
+    bl_label = "Set Up Cloth"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1138,7 +1148,7 @@ Existing baked caches require explicit Rebuild Bake"""
             return {'CANCELLED'}
         existing = find_cloth_modifier(obj)
         if existing and existing.point_cache.is_baked:
-            self.report({'ERROR'}, 'A baked cache exists. Use Rebuild Bake to replace it explicitly.')
+            self.report({'ERROR'}, 'This cloth is baked. Use Re-bake to apply new settings, or Delete Bake first.')
             return {'CANCELLED'}
         try:
             baking.effective_range(scene, obj.quick_cloth)
@@ -1167,7 +1177,7 @@ Existing baked caches require explicit Rebuild Bake"""
         if animator_mode_active(obj):
             self.report({'ERROR'},
                         "Animator Mode is on (the cloth is muted) — press "
-                        "Exit Animator Mode first, then Simulate")
+                        "Exit Animator Mode first, then Set Up Cloth")
             return {'CANCELLED'}
 
         try:
@@ -1238,16 +1248,15 @@ Existing baked caches require explicit Rebuild Bake"""
                     f"({props.preset.replace('_', ' ').title()}, "
                     f"frames {cache.frame_start}–{cache.frame_end}"
                     + (f", {props.settle_frames} settle frames" if props.settle_frames else "")
-                    + "). Press Spacebar to play")
+                    + "). Press Play from the first frame to preview")
         return {'FINISHED'}
 
 
 class QC_OT_set_pin_group(Operator):
-    """Turn the current Edit-Mode vertex selection into the "pin" vertex
-group (weight 1.0). Pinned vertices hold to the object's own animation —
-weight the collar/waistband and let everything else simulate"""
+    """Pin the vertices selected in Edit Mode (replaces the pin group's previous selection).
+Pinned vertices stick to the object or rig: pin the collar or waistband and let the rest move"""
     bl_idname = "quick_cloth.set_pin_group"
-    bl_label = "Set Pin Group"
+    bl_label = "Pin Selected Vertices"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1290,11 +1299,9 @@ weight the collar/waistband and let everything else simulate"""
 
 
 class QC_OT_pin_from_rig_weights(Operator):
-    """Build the "pin" group automatically from the armature's deform
-weights: every vertex is pinned by its combined bone weight, so a freshly
-auto-weighted garment follows the rig out of the box. Then paint DOWN the
-pin weights (Weight Paint mode) wherever fabric should swing free. Keeps
-Set Pin Group untouched for manual selections"""
+    """Pin every vertex by how strongly the rig moves it, so the garment follows the rig.
+Then lower the pin weights in Weight Paint mode wherever the fabric should swing freely.
+Bone weights are never changed"""
     bl_idname = "quick_cloth.pin_from_rig_weights"
     bl_label = "Pin From Rig Weights"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1383,12 +1390,10 @@ Set Pin Group untouched for manual selections"""
 
 
 class QC_OT_make_colliders(Operator):
-    """Add a tuned Collision modifier to all selected objects so the cloth
-can rest on them — chairs, bodies, tables. Works on rigged meshes untouched
-(collision uses the deformed mesh, so animated characters collide
-correctly). Idempotent"""
+    """Make the selected objects colliders so the cloth can rest on them: chairs, bodies, tables.
+Rigged characters keep working and collide as they move. Existing colliders are left as they are"""
     bl_idname = "quick_cloth.make_colliders"
-    bl_label = "Make Collider(s)"
+    bl_label = "Make Selected Colliders"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1420,9 +1425,9 @@ correctly). Idempotent"""
 
 
 class QC_OT_body_collider(Operator):
-    """Enable collision on the chosen body without adding rigid-body physics"""
+    """Make the chosen body a collider so the cloth rests on it. No rigid-body physics is added"""
     bl_idname = 'quick_cloth.body_collider'
-    bl_label = 'Make Body Collider'
+    bl_label = 'Make Body a Collider'
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -1439,7 +1444,7 @@ class QC_OT_body_collider(Operator):
 
 
 class QC_OT_remove_wind(Operator):
-    """Delete the QC_Wind rig (the wind and turbulence empties)"""
+    """Delete the wind and gust fields Quick Cloth created for this cloth"""
     bl_idname = "quick_cloth.remove_wind"
     bl_label = "Remove Wind"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1456,8 +1461,9 @@ class QC_OT_remove_wind(Operator):
 
 
 class QC_OT_diagnose(Operator):
+    """Look for setup problems, and check whether the cloth already cuts into the body on this frame"""
     bl_idname = 'quick_cloth.diagnose'
-    bl_label = 'Inspect Setup / Current Contact'
+    bl_label = 'Check for Problems'
 
     def execute(self, context):
         obj = context.active_object
@@ -1474,8 +1480,9 @@ class QC_OT_diagnose(Operator):
 
 
 class QC_OT_validate_bake(Operator):
+    """Compare the scene with how it was when the cloth was baked, to see whether a Re-bake is needed"""
     bl_idname = 'quick_cloth.validate_bake'
-    bl_label = 'Validate Cache Dependencies'
+    bl_label = 'Check Bake'
 
     def execute(self, context):
         obj = context.active_object
@@ -1490,13 +1497,13 @@ class QC_OT_validate_bake(Operator):
         p.bake_needs_validation = not same
         p.bake_state = 'BAKED' if same else 'DIRTY'
         self.report({'INFO'} if same else {'WARNING'},
-                    'Recorded dependencies match; verify external driver inputs and visual result' if same
-                    else 'Dependencies differ or cache has no recorded signature; rebuild the bake')
+                    'Bake matches the scene; still check the result visually (outside driver inputs can\'t be tracked)' if same
+                    else 'The scene changed since this bake (or it has no record); Re-bake to update it')
         return {'FINISHED'}
 
 
 class QC_OT_bake(Operator):
-    """Validate, apply current settings, and bake exactly the displayed range"""
+    """Apply the current settings and save the simulation for the shown frames, so it plays back fast and renders the same every time"""
     bl_idname = 'quick_cloth.bake'
     bl_label = 'Bake Cloth'
     rebuild: BoolProperty(default=False)
@@ -1529,7 +1536,7 @@ class QC_OT_bake(Operator):
             self.report({'WARNING'}, warning)
         p, mod = obj.quick_cloth, find_cloth_modifier(obj)
         if mod.point_cache.is_baked and not self.rebuild:
-            self.report({'ERROR'}, 'A usable bake exists. Choose Rebuild Bake explicitly.')
+            self.report({'ERROR'}, 'A bake already exists. Use Re-bake to replace it.')
             return {'CANCELLED'}
         self._obj = obj
         self._scene = context.scene
@@ -1618,8 +1625,9 @@ class QC_OT_bake(Operator):
 
 
 class QC_OT_free_bake(Operator):
+    """Delete this cloth's saved bake so its settings can be changed and simulated live again"""
     bl_idname = 'quick_cloth.free_bake'
-    bl_label = 'Free Bake'
+    bl_label = 'Delete Bake'
 
     @classmethod
     def poll(cls, context):
@@ -1631,17 +1639,17 @@ class QC_OT_free_bake(Operator):
         try:
             baking.free(context, context.active_object)
         except Exception as exc:
-            self.report({'ERROR'}, f'Free Bake failed: {exc}')
+            self.report({'ERROR'}, f'Delete Bake failed: {exc}')
             return {'CANCELLED'}
-        self.report({'INFO'}, 'Freed the target cloth cache')
+        self.report({'INFO'}, 'Deleted the bake for this cloth')
         return {'FINISHED'}
 
 
 class QC_OT_apply_as_shape(Operator):
-    """Snapshot the cloth at the current frame as a NEW object — extract a
-nicely draped couch cushion or hung coat without destroying the sim setup"""
+    """Copy the cloth as it looks on this frame into a new, separate object.
+Handy for a draped cushion or hung coat; the simulation itself is unchanged"""
     bl_idname = "quick_cloth.apply_as_shape"
-    bl_label = "Create Static Snapshot"
+    bl_label = "Freeze Frame as New Object"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1675,10 +1683,8 @@ nicely draped couch cushion or hung coat without destroying the sim setup"""
 
 
 class QC_OT_bind_render_mesh(Operator):
-    """Proxy workflow: with the low-poly SIM mesh active and the high-res
-RENDER mesh also selected, add a Surface Deform modifier to the render mesh
-targeting the sim mesh and Bind it. Simulate a 5k-vert proxy, drive a
-500k-vert garment. Run again on a bound mesh to Unbind"""
+    """Make a detailed render mesh follow this simpler cloth (select the render mesh, then the cloth last).
+Bind attaches, Rebind re-attaches after edits, Unbind detaches. Do it on the first simulation frame"""
     bl_idname = "quick_cloth.bind_render_mesh"
     bl_label = "Bind Render Mesh"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1771,8 +1777,9 @@ targeting the sim mesh and Bind it. Simulate a 5k-vert proxy, drive a
 
 
 class QC_OT_enter_animator_mode(Operator):
+    """Hide the cloth and show a light stand-in that follows the rig, so playback stays fast while you animate"""
     bl_idname = 'quick_cloth.enter_animator_mode'
-    bl_label = 'Enter Animator Mode'
+    bl_label = 'Start Animator Mode'
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1809,8 +1816,9 @@ class QC_OT_enter_animator_mode(Operator):
 
 
 class QC_OT_exit_animator_mode(Operator):
+    """Bring the cloth back and hide the stand-in. Also recovers cloth left hidden by Animator Mode"""
     bl_idname = 'quick_cloth.exit_animator_mode'
-    bl_label = 'Exit / Recover Animator Mode'
+    bl_label = 'Exit Animator Mode'
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1853,189 +1861,450 @@ class QC_OT_exit_animator_mode(Operator):
         if not garment.hide_get():
             garment.select_set(True)
         context.view_layer.objects.active = garment
-        self.report({'INFO'}, 'Garment restored; existing bake preserved. Validate or rebuild after animation edits.')
+        self.report({'INFO'}, 'Cloth restored; its bake was kept. After animation edits, use Check Bake or Re-bake.')
         return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
-# PANEL
+# PANELS
 # ---------------------------------------------------------------------------
+# The parent panel says what the selected object needs next. Numbered child
+# panels follow the setup order; rarely changed settings live in closed
+# "More ..." sub-panels.
 
-class QC_PT_panel(Panel):
-    bl_label = "Quick Cloth"
-    bl_idname = "QC_PT_panel"
+PRESET_HINTS = {
+    'SIMPLE': 'Light and quick to solve. Good for testing.',
+    'COTTON': 'T-shirts and pants: soft, with small wrinkles.',
+    'POLYESTER': 'Springy and floaty; holds its shape.',
+    'COUCH_LEATHER': 'Thick upholstery: heavy, big soft folds.',
+    'LEATHER_COAT': 'Stiff panels that swing together.',
+    'LATEX': 'Skin-tight and stretchy; shrinks onto the body.',
+    'STRETCH_DENIM': 'Jeans with stretch: a light hug fit.',
+    'RIGID_DENIM': 'Classic heavy denim with structured folds.',
+    'SELVEDGE_DENIM': 'The stiffest fabric: boardy, holds creases.',
+}
+
+QUALITY_HINTS = {
+    'PREVIEW': 'Fast and rough: for checking timing.',
+    'MEDIUM': 'Balanced: good for most shots.',
+    'HIGH': 'Slow and careful: fast motion, tight contact.',
+    'CUSTOM': 'Your own steps, set in More Simulation Options.',
+    'FINAL': 'Values kept from an older Quick Cloth version.',
+}
+
+# Cache state -> (icon, headline, explanation)
+STATE_TEXT = {
+    'READY': ('PLAY', 'Set up and ready',
+              'Press Play (Space) from the first frame to preview, or Bake to save the result.'),
+    'BAKING': ('TIME', 'Baking...', 'Press Esc to cancel.'),
+    'BAKED': ('CHECKMARK', 'Baked and up to date',
+              'Playback and renders use the saved result. To change settings, edit them and Re-bake.'),
+    'DIRTY': ('ERROR', 'Bake is out of date',
+              'Settings or frames changed since the bake. Re-bake to see the changes.'),
+    'NEEDS_VALIDATION': ('QUESTION', 'Bake needs a check',
+                         'The scene changed or the file was reopened. Press Check Bake, or Re-bake.'),
+    'FAILED': ('CANCEL', 'Last bake failed', 'See the message in step 4, fix it, then Bake again.'),
+    'CANCELLED': ('CANCEL', 'Last bake was cancelled', 'Press Bake to try again.'),
+}
+
+
+def show_hints(context):
+    addon = context.preferences.addons.get(__package__)
+    prefs = addon.preferences if addon else None
+    return prefs is None or prefs.show_hints
+
+
+def wrapped(layout, context, text, icon='NONE'):
+    """Labels don't wrap in Blender; split text to the sidebar width."""
+    width = context.region.width if context.region else 300
+    margin = 70 if icon != 'NONE' else 45
+    chars = max(18, int((width - margin) / (5.8 * context.preferences.view.ui_scale)))
+    col = layout.column(align=True)
+    col.scale_y = .8
+    for index, line in enumerate(textwrap.wrap(text, chars) or ['']):
+        col.label(text=line, icon=icon if index == 0 else ('BLANK1' if icon != 'NONE' else 'NONE'))
+
+
+def hint(layout, context, text):
+    """Help text the user can hide with the ? button in the panel header."""
+    if show_hints(context):
+        wrapped(layout, context, text, icon='INFO')
+
+
+def is_cage(obj):
+    return bool(obj and obj.get('qc_helper') == 'cage')
+
+
+def is_set_up(obj):
+    return bool(obj.quick_cloth.setup_id and find_cloth_modifier(obj))
+
+
+class QCPanel:
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Quick Cloth"
+    bl_category = 'Quick Cloth'
+
+
+class QCStepPanel(QCPanel):
+    """Child panel shown for a garment mesh (not the Animator Mode stand-in)."""
+    bl_parent_id = 'QC_PT_panel'
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return bool(obj and obj.type == 'MESH' and not is_cage(obj))
+
+
+class QC_PT_panel(QCPanel, Panel):
+    bl_label = "Quick Cloth"
+    bl_idname = "QC_PT_panel"
+
+    def draw_header_preset(self, context):
+        addon = context.preferences.addons.get(__package__)
+        if addon and addon.preferences:
+            self.layout.prop(addon.preferences, 'show_hints', text='', icon='HELP')
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        box = layout.box()
+        if obj is None or obj.type != 'MESH':
+            box.label(text='Nothing to simulate yet', icon='RESTRICT_SELECT_OFF')
+            wrapped(box, context, 'Select the mesh you want to turn into cloth.')
+            return
+        if is_cage(obj) or obj.quick_cloth.animator_state:
+            box.label(text='Animator Mode is on', icon='ARMATURE_DATA')
+            wrapped(box, context, 'The cloth is hidden and a light stand-in follows the rig '
+                                  'so playback stays fast. Exit to bring the cloth back.')
+            box.operator('quick_cloth.exit_animator_mode', icon='LOOP_BACK')
+            return
+        p = obj.quick_cloth
+        if QC_OT_adopt.poll(context):
+            if p.setup_id:
+                box.label(text='Copied cloth setup', icon='DUPLICATE')
+                wrapped(box, context, 'Give this copy its own settings so it can be baked separately.')
+                box.operator('quick_cloth.adopt', text='Make Independent Copy', icon='IMPORT')
+            else:
+                box.label(text='This mesh already has cloth', icon='MOD_CLOTH')
+                wrapped(box, context, 'Adopt it to manage it here. Its settings and any bake '
+                                      'stay exactly as they are.')
+                box.operator('quick_cloth.adopt', icon='IMPORT')
+            return
+        if not is_set_up(obj):
+            box.label(text='Not set up yet', icon='MOD_CLOTH')
+            wrapped(box, context, 'Go through steps 1-3 (only Fabric is required), '
+                                  'then press Set Up Cloth in step 4.')
+            return
+        icon, headline, text = STATE_TEXT[baking.state(context, obj)]
+        box.label(text=headline, icon=icon)
+        wrapped(box, context, text)
+
+
+class QC_PT_fabric(QCStepPanel, Panel):
+    bl_label = "1. Fabric"
+    bl_idname = "QC_PT_fabric"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = not baking.any_baking()
+        props = get_props(context)
+        hint(layout, context, 'What is the cloth made of? A fabric fills in the settings below; '
+                              'you can still change them.')
+        layout.prop(props, "preset", text="")
+        wrapped(layout, context, PRESET_HINTS.get(props.preset, ''))
+        col = layout.column(align=True)
+        col.prop(props, "mass")
+        col.prop(props, "air_damping")
+
+
+class QC_PT_fabric_detail(QCStepPanel, Panel):
+    bl_label = "Fine-Tune Fabric"
+    bl_parent_id = "QC_PT_fabric"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = not baking.any_baking()
+        props = get_props(context)
+        hint(layout, context, 'Stiffness: how much the cloth resists each kind of change. '
+                              'Damping: how quickly bouncing settles.')
+        col = layout.column(align=True)
+        col.label(text="Stiffness")
+        col.prop(props, "tension_stiffness")
+        col.prop(props, "compression_stiffness")
+        col.prop(props, "shear_stiffness")
+        col.prop(props, "bending_stiffness")
+        col = layout.column(align=True)
+        col.label(text="Damping")
+        col.prop(props, "tension_damping")
+        col.prop(props, "compression_damping")
+        col.prop(props, "shear_damping")
+        col.prop(props, "bending_damping")
+        layout.prop(props, "time_scale")
+        layout.prop(props, "use_internal_springs")
+        if props.use_internal_springs:
+            layout.prop(props, "internal_stiffness")
+
+
+class QC_PT_fabric_shape(QCStepPanel, Panel):
+    bl_label = "Shrink, Seams & Inflation"
+    bl_parent_id = "QC_PT_fabric"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = not baking.any_baking()
+        props = get_props(context)
+        layout.prop(props, "fit_tightness")
+        if props.legacy_fit:
+            wrapped(layout, context, 'Kept the adopted cloth\'s original shrink value.', icon='INFO')
+        layout.prop(props, "use_sewing")
+        if props.use_sewing:
+            layout.prop(props, "sewing_force")
+        layout.prop(props, "use_pressure")
+        if props.use_pressure:
+            col = layout.column(align=True)
+            col.prop(props, "pressure_force")
+            col.prop(props, "pressure_target_volume")
+
+
+class QC_PT_pins(QCStepPanel, Panel):
+    bl_label = "2. Pins"
+    bl_idname = "QC_PT_pins"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = not baking.any_baking()
+        obj = context.active_object
+        props = get_props(context)
+        hint(layout, context, 'Pinned vertices stick to the object or its rig, like a collar or '
+                              'waistband; the rest hangs freely. A loose sheet needs no pins.')
+        col = layout.column(align=True)
+        col.label(text='Pin Group')
+        col.prop_search(props, 'pin_group', obj, 'vertex_groups', text='')
+        if not props.pin_group:
+            found = find_pin_group(obj)
+            if found is not None:
+                layout.label(text=f"Will use the '{found.name}' group", icon='GROUP_VERTEX')
+        else:
+            layout.label(text=f'Pinned: {props.coverage_text}', icon='GROUP_VERTEX')
+        layout.operator("quick_cloth.set_pin_group", icon='PINNED')
+        if context.mode != 'EDIT_MESH':
+            hint(layout, context, 'To pin by hand: Tab into Edit Mode, select vertices, '
+                                  'then press Pin Selected Vertices.')
+        if any(m.type == 'ARMATURE' and m.object for m in obj.modifiers):
+            layout.operator("quick_cloth.pin_from_rig_weights", icon='ARMATURE_DATA')
+            hint(layout, context, 'Pins every vertex the rig moves. Afterwards, paint pin '
+                                  'weights down where the cloth should swing.')
+        layout.prop(props, "pin_stiffness")
+
+
+class QC_PT_pins_more(QCStepPanel, Panel):
+    bl_label = "More Pin Options"
+    bl_parent_id = "QC_PT_pins"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        self.layout.enabled = not baking.any_baking()
+        self.layout.prop(get_props(context), 'dynamic_mesh')
+
+
+class QC_PT_collisions(QCStepPanel, Panel):
+    bl_label = "3. Collisions"
+    bl_idname = "QC_PT_collisions"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = not baking.any_baking()
+        props = get_props(context)
+        hint(layout, context, 'Choose what the cloth rests on or wraps around. Only colliders '
+                              'are felt by the cloth.')
+        col = layout.column(align=True)
+        col.label(text='Body / Obstacle')
+        col.prop(props, 'body', text='')
+        body = props.body
+        if body is not None:
+            collider = next((m for m in body.modifiers if m.type == 'COLLISION'), None)
+            if collider and collider.show_viewport and body.collision and body.collision.use:
+                layout.label(text=f'{body.name} is a collider', icon='CHECKMARK')
+            else:
+                layout.operator('quick_cloth.body_collider', icon='MOD_PHYSICS')
+        layout.operator("quick_cloth.make_colliders", icon='MESH_ICOSPHERE')
+        layout.prop(props, "use_self_collision")
+        if props.use_self_collision:
+            layout.prop(props, "self_distance")
+        layout.operator('quick_cloth.diagnose', icon='VIEWZOOM')
+        for message in props.diagnostics.splitlines():
+            wrapped(layout, context, message, icon='INFO')
+
+
+class QC_PT_collisions_more(QCStepPanel, Panel):
+    bl_label = "More Collision Options"
+    bl_parent_id = "QC_PT_collisions"
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
         layout.enabled = not baking.any_baking()
         props = get_props(context)
         obj = context.active_object
-        if QC_OT_adopt.poll(context):
-            layout.operator('quick_cloth.adopt', icon='IMPORT')
-
-        # 1. Preset dropdown — top, full width.
-        layout.prop(props, "preset", text="")
-
-        # 2. Fabric column.
+        layout.prop(props, 'use_object_collision')
+        layout.prop(props, "object_distance")
+        layout.prop(props, 'collider_thickness')
         col = layout.column(align=True)
-        col.prop(props, "mass")
-        col.prop(props, "air_damping")
-        col.prop(props, "show_fabric_detail",
-                 icon='TRIA_DOWN' if props.show_fabric_detail else 'TRIA_RIGHT',
-                 emboss=False)
-        if props.show_fabric_detail:
-            sub = col.box().column(align=True)
-            sub.prop(props, "tension_stiffness")
-            sub.prop(props, "compression_stiffness")
-            sub.prop(props, "shear_stiffness")
-            sub.prop(props, "bending_stiffness")
-            sub.separator()
-            sub.prop(props, "tension_damping")
-            sub.prop(props, "compression_damping")
-            sub.prop(props, "shear_damping")
-            sub.prop(props, "bending_damping")
-            sub.separator()
-            sub.prop(props, "time_scale")
-            sub.prop(props, "use_internal_springs")
-            if props.use_internal_springs:
-                sub.prop(props, "internal_stiffness")
+        col.prop(props, 'impulse_clamp')
+        col.prop(props, 'self_impulse_clamp')
+        layout.prop(props, "use_collision_objects")
+        colliders = [o for o in context.scene.objects if o != obj and any(
+            m.type == 'COLLISION' and m.show_viewport for m in o.modifiers)]
+        layout.label(text=f'{len(colliders)} collider(s) in this scene')
 
-        # 3. Garment box.
-        box = layout.box()
-        box.label(text="Garment", icon='MOD_CLOTH')
-        pin_group = find_pin_group(obj) if obj else None
-        if pin_group is not None:
-            box.label(text=f"Pin group found \u2713 ({pin_group.name})",
-                      icon='GROUP_VERTEX')
-        else:
-            box.label(text="No pin group", icon='GROUP_VERTEX')
-        box.operator("quick_cloth.set_pin_group", icon='PINNED')
-        box.operator("quick_cloth.pin_from_rig_weights",
-                     icon='ARMATURE_DATA')
-        box.prop(props, "pin_stiffness")
-        if obj and obj.type == 'MESH':
-            box.prop_search(props, 'pin_group', obj, 'vertex_groups')
-            box.label(text=f'Attachment coverage: {props.coverage_text}')
-        box.prop(props, 'dynamic_mesh')
-        box.prop(props, "fit_tightness")
-        if props.legacy_fit:
-            box.label(text='Adopted shrink value preserved; positive shrinks', icon='INFO')
-        row = box.row(align=True)
-        row.prop(props, "use_sewing")
-        sub = row.row()
-        sub.enabled = props.use_sewing
-        sub.prop(props, "sewing_force", text="Force")
-        pbox = box.box()
-        pbox.prop(props, "use_pressure")
-        if props.use_pressure:
-            pbox.prop(props, "pressure_force")
-            pbox.prop(props, "pressure_target_volume")
 
-        # 4. Forces box.
-        box = layout.box()
-        box.label(text="Forces", icon='FORCE_WIND')
-        box.prop(props, "use_wind")
-        if props.use_wind:
-            box.prop(props, "wind_direction")
-            box.prop(props, "wind_strength")
-            box.prop(props, "wind_turbulence")
-            box.prop(props, "wind_seed")
-        box.operator("quick_cloth.remove_wind", icon='X')
-        box.prop(props, "gravity_influence")
+class QC_PT_bake(QCStepPanel, Panel):
+    bl_label = "4. Simulate & Bake"
+    bl_idname = "QC_PT_bake"
 
-        # 5. Collisions box.
-        box = layout.box()
-        box.label(text="Collisions", icon='PHYSICS')
-        box.prop(props, 'use_object_collision')
-        box.prop(props, 'body')
-        box.prop(props, 'collider_thickness')
-        box.operator('quick_cloth.body_collider')
-        box.prop(props, "use_collision_objects")
-        box.operator("quick_cloth.make_colliders", icon='MESH_ICOSPHERE')
-        box.prop(props, "object_distance")
-        box.prop(props, 'impulse_clamp')
-        box.prop(props, 'self_impulse_clamp')
-        box.operator('quick_cloth.diagnose', icon='VIEWZOOM')
-        for message in props.diagnostics.splitlines():
-            box.label(text=message, icon='INFO')
-        colliders = [o for o in context.scene.objects if o != obj and any(m.type == 'COLLISION' and m.show_viewport for m in o.modifiers)]
-        box.label(text=f'{len(colliders)} enabled scene collider(s); existing filters preserved')
-        row = box.row(align=True)
-        row.prop(props, "use_self_collision")
-        sub = row.row()
-        sub.enabled = props.use_self_collision
-        sub.prop(props, "self_distance", text="Distance")
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = not baking.any_baking()
+        obj = context.active_object
+        props = get_props(context)
+        hint(layout, context, 'Set Up Cloth applies your settings; press Play to preview. '
+                              'Bake saves the result so it plays fast and renders the same every time.')
+        row = layout.row(align=True)
+        row.prop(props, "frame_start", text="Start")
+        row.prop(props, "frame_end", text="End")
+        try:
+            start, end = baking.effective_range(context.scene, props)
+            layout.label(text=f'Simulates frames {start}–{end} ({end - start + 1} frames)')
+        except ValueError as exc:
+            wrapped(layout, context, str(exc), icon='ERROR')
 
-        # 6. Simulation box.
-        box = layout.box()
-        box.label(text="Simulation", icon='SCENE_DATA')
-        row = box.row(align=True)
+        layout.label(text="Quality")
+        row = layout.row(align=True)
         for tier in ('PREVIEW', 'MEDIUM', 'HIGH', 'CUSTOM'):
             op = row.operator('quick_cloth.quality', text=tier.title(), depress=props.quality_mode == tier)
             op.tier = tier
-        steps, collisions = resolve_quality(props)
-        box.label(text=f'Effective: {steps} solver steps / {collisions} collision iterations')
-        box.prop(props, "frame_start")
-        box.prop(props, "frame_end")
-        box.prop(props, "settle_frames")
-        box.prop(props, "use_preview_range")
-        box.prop(props, "quality_steps")
-        box.prop(props, "collision_quality")
-        box.prop(props, "use_disk_cache")
-        row = box.row(align=True)
-        state = baking.state(context, obj) if obj and obj.type == 'MESH' else 'NO_SETUP'
-        box.label(text=f'Cache: {state.replace("_", " ").title()}')
-        if state == 'BAKING':
-            box.label(text='Native bake running — press Esc to cancel')
-        errors, warnings = baking.preflight(context, obj) if obj and obj.type == 'MESH' else (['Select a mesh'], [])
-        for error in errors[:4]:
-            box.label(text=error, icon='ERROR')
-        for warning in warnings[:3]:
-            box.label(text=warning, icon='INFO')
-        mod = baking.cloth(obj) if obj and obj.type == 'MESH' else None
-        rebuild = bool(mod and mod.point_cache.is_baked)
-        op = row.operator('quick_cloth.bake', text='Rebuild Bake' if rebuild else f'Bake {props.quality_mode.title()}', icon='RENDER_ANIMATION')
-        op.rebuild = rebuild
-        row.operator("quick_cloth.free_bake", icon='TRASH')
-        if rebuild:
-            box.operator('quick_cloth.validate_bake')
+        wrapped(layout, context, QUALITY_HINTS.get(props.quality_mode, ''))
+
+        mod = baking.cloth(obj)
+        baked = bool(mod and mod.point_cache.is_baked)
+        set_up = is_set_up(obj)
+        layout.separator()
+        if not baked:
+            row = layout.row()
+            row.scale_y = 1.5
+            row.operator("quick_cloth.simulate", icon='MOD_CLOTH',
+                         text='Update Cloth Settings' if set_up else 'Set Up Cloth')
+        if set_up:
+            row = layout.row(align=True)
+            row.scale_y = 1.3
+            op = row.operator('quick_cloth.bake', text='Re-bake' if baked else 'Bake',
+                              icon='RENDER_ANIMATION')
+            op.rebuild = baked
+            row.operator("quick_cloth.free_bake", icon='TRASH')
+            if baked and baking.state(context, obj) in {'DIRTY', 'NEEDS_VALIDATION'}:
+                layout.operator('quick_cloth.validate_bake', icon='CHECKMARK')
+            errors, warnings = baking.preflight(context, obj)
+            for error in errors[:2]:
+                wrapped(layout, context, error, icon='ERROR')
+            for warning in warnings[:2]:
+                wrapped(layout, context, warning, icon='INFO')
         if props.bake_error:
-            box.label(text=props.bake_error, icon='ERROR')
-        try:
-            start, end = baking.effective_range(context.scene, props)
-            box.label(text=f'Simulation: {start}–{end} ({end-start+1} frames)')
-            if props.use_disk_cache:
-                box.label(text=str(baking.cache_directory()))
-        except ValueError as exc:
-            box.label(text=str(exc), icon='ERROR')
-        box.operator("quick_cloth.apply_as_shape", icon='MESH_DATA')
-        row = box.row(align=True)
+            wrapped(layout, context, props.bake_error, icon='ERROR')
+
+
+class QC_PT_bake_more(QCStepPanel, Panel):
+    bl_label = "More Simulation Options"
+    bl_parent_id = "QC_PT_bake"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = not baking.any_baking()
+        props = get_props(context)
+        layout.prop(props, "settle_frames")
+        layout.prop(props, "use_preview_range")
+        layout.prop(props, "use_disk_cache")
+        if props.use_disk_cache:
+            try:
+                wrapped(layout, context, str(baking.cache_directory()), icon='FILE_FOLDER')
+            except ValueError as exc:
+                wrapped(layout, context, str(exc), icon='ERROR')
+        col = layout.column(align=True)
+        col.prop(props, "quality_steps")
+        col.prop(props, "collision_quality")
+        steps, collisions = resolve_quality(props)
+        layout.label(text=f'In use: {steps} solver / {collisions} collision steps')
+
+
+class QC_PT_forces(QCStepPanel, Panel):
+    bl_label = "Wind & Gravity"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = not baking.any_baking()
+        props = get_props(context)
+        layout.prop(props, "gravity_influence")
+        layout.prop(props, "use_wind")
+        if props.use_wind:
+            hint(layout, context, 'The wind is created or updated when you press Set Up Cloth.')
+            layout.prop(props, "wind_direction")
+            col = layout.column(align=True)
+            col.prop(props, "wind_strength")
+            col.prop(props, "wind_turbulence")
+            col.prop(props, "wind_seed")
+        layout.operator("quick_cloth.remove_wind", icon='X')
+
+
+class QC_PT_animator(QCStepPanel, Panel):
+    bl_label = "Animator Mode"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = not baking.any_baking()
+        props = get_props(context)
+        hint(layout, context, 'Hides the cloth and shows a light stand-in that follows the rig, '
+                              'so playback stays fast while you animate. No cloth is solved.')
+        layout.prop(props, "cage_ratio")
+        layout.operator("quick_cloth.enter_animator_mode", icon='MESH_GRID')
+        if QC_OT_exit_animator_mode.poll(context):
+            layout.operator('quick_cloth.exit_animator_mode', text='Recover Hidden Cloth',
+                            icon='HIDE_OFF')
+
+
+class QC_PT_proxy(QCStepPanel, Panel):
+    bl_label = "Render Mesh & Snapshot"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = not baking.any_baking()
+        hint(layout, context, 'Let a detailed render mesh follow this simpler cloth: select the '
+                              'render mesh, Shift-click this cloth last, go to the first frame, '
+                              'then press Bind.')
+        row = layout.row(align=True)
         for action in ('BIND', 'REBIND', 'UNBIND'):
             op = row.operator('quick_cloth.bind_render_mesh', text=action.title())
             op.action = action
+        hint(layout, context, 'Freeze the cloth as it looks on this frame into a new object.')
+        layout.operator("quick_cloth.apply_as_shape", icon='MESH_DATA')
 
-        # 6b. Animator Mode box.
-        box = layout.box()
-        box.label(text="Animator Mode", icon='ARMATURE_DATA')
-        if animator_mode_active(obj):
-            box.label(text="Animating with cage \u2014 cloth muted",
-                      icon='CHECKMARK')
-            box.operator("quick_cloth.exit_animator_mode",
-                         icon='LOOP_BACK')
-        else:
-            box.prop(props, "cage_ratio")
-            box.operator("quick_cloth.enter_animator_mode",
-                         icon='MESH_GRID')
-            box.operator('quick_cloth.exit_animator_mode', text='Recover Hidden Garment')
 
-        # 7. Big final button.
-        layout.separator()
-        row = layout.row()
-        row.scale_y = 1.6
-        row.operator("quick_cloth.simulate", icon='MOD_CLOTH')
+class QCPreferences(AddonPreferences):
+    bl_idname = __package__
+
+    show_hints: BoolProperty(
+        name="Show Help Text",
+        description="Show short explanations in the Quick Cloth panel. "
+                    "Toggle with the ? button in the panel header",
+        default=True,
+    )
+
+    def draw(self, context):
+        self.layout.prop(self, 'show_hints')
 
 
 # ---------------------------------------------------------------------------
@@ -2043,6 +2312,7 @@ class QC_PT_panel(Panel):
 # ---------------------------------------------------------------------------
 
 classes = (
+    QCPreferences,
     QCSetupRef,
     QuickClothProps,
     QC_OT_adopt,
@@ -2062,8 +2332,19 @@ classes = (
     QC_OT_enter_animator_mode,
     QC_OT_exit_animator_mode,
     QC_PT_panel,
+    QC_PT_fabric,
+    QC_PT_fabric_detail,
+    QC_PT_fabric_shape,
+    QC_PT_pins,
+    QC_PT_pins_more,
+    QC_PT_collisions,
+    QC_PT_collisions_more,
+    QC_PT_bake,
+    QC_PT_bake_more,
+    QC_PT_forces,
+    QC_PT_animator,
+    QC_PT_proxy,
 )
-
 
 _registered = []
 
