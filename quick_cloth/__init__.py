@@ -1151,10 +1151,13 @@ Existing baked caches require explicit Rebuild Bake"""
             return {'CANCELLED'}
         for warning in warnings:
             self.report({'WARNING'}, warning)
-        try:
-            props = initialize_setup(obj, scene)
-        except ValueError as exc:
-            self.report({'ERROR'}, str(exc))
+
+        # Reject before initialize_setup so a refused run registers nothing.
+        # Never simulate the cage itself — it's a deform-only stand-in.
+        if obj.get('qc_helper') == 'cage':
+            self.report({'ERROR'},
+                        "This is the animation cage — select the real "
+                        "garment to simulate")
             return {'CANCELLED'}
 
         if object_is_override_locked(obj):
@@ -1167,11 +1170,10 @@ Existing baked caches require explicit Rebuild Bake"""
                         "Exit Animator Mode first, then Simulate")
             return {'CANCELLED'}
 
-        # Never simulate the cage itself — it's a deform-only stand-in.
-        if obj.get('qc_helper') == 'cage':
-            self.report({'ERROR'},
-                        "This is the animation cage — select the real "
-                        "garment to simulate")
+        try:
+            props = initialize_setup(obj, scene)
+        except ValueError as exc:
+            self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
 
         # 1. Cloth modifier — reuse existing (idempotent: running twice

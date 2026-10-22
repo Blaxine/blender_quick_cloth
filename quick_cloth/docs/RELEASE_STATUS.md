@@ -15,7 +15,7 @@ Updated: 2026-10-18. Eight implementation slices are delivered as separate commi
 
 Automated evidence is in `tests/results/summary.json` in the source repository. Tests use Blender 4.1.1 and 5.1.2 in disposable factory-startup processes, and actual source without audit patches. Small numerical fixtures include an unrigged cloth drop onto a collider and a rig-driven attachment. Full visual acceptance is a separate gate.
 
-Final run: **26/26 test executions passed** (13 programs on each version). Extension manifest validation also passed on 5.1.2. Archive tests validate layout and extracted-code registration, not an interactive installation workflow.
+Slice run: **26/26 test executions passed** (13 programs on each version). Extension manifest validation also passed on 5.1.2. Later review fixes raised the suite to 18 programs; the latest run passed 36/36 on Blender 4.5.4 LTS and 5.2.2 LTS (see `docs/SEVENTH_REVIEW_FIXES.md`). Archive tests validate layout and extracted-code registration, not an interactive installation workflow.
 
 ## Finding dispositions
 

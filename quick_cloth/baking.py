@@ -199,6 +199,25 @@ def rna_values(data, excluded=()):
     return values
 
 
+def id_property_value(value):
+    """Plain JSON form of a custom property.
+
+    Group/array reprs embed memory addresses (e.g. other add-ons' registered
+    settings such as Cycles), which would change the signature on every reload.
+    """
+    if isinstance(value, bpy.types.ID):
+        return value.name_full
+    if hasattr(value, 'to_dict'):
+        value = value.to_dict()
+    elif hasattr(value, 'to_list'):
+        value = value.to_list()
+    if isinstance(value, dict):
+        return {str(k): id_property_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [id_property_value(v) for v in value]
+    return value
+
+
 def static_transform_channels(item, animation, prefix=''):
     """Hash authored channels not driven by actions, NLA, or drivers.
 
@@ -240,13 +259,14 @@ def signature(scene, obj):
     state = [bpy.app.version_string, rna_values(p, excluded),
              (scene.render.fps, scene.render.fps_base, tuple(scene.gravity), scene.use_gravity, scene.unit_settings.scale_length),
              effective_range(scene, p)]
-    state.append({k: scene[k] for k in scene.keys() if k not in {'quick_cloth', 'quick_cloth_registry'}})
+    state.append({k: id_property_value(scene[k]) for k in scene.keys()
+                  if k not in {'quick_cloth', 'quick_cloth_registry'}})
     for item in sorted(scene.objects, key=lambda o: o.name):
         if item.get('qc_helper') == 'cage':
             continue
         data = [item.name, item.type, item.parent.name if item.parent else None,
                 sorted(c.name for c in item.users_collection),
-                {k: item[k] for k in item.keys() if k != 'quick_cloth' and not k.startswith('qc_')},
+                {k: id_property_value(item[k]) for k in item.keys() if k != 'quick_cloth' and not k.startswith('qc_')},
                 action_data(item.animation_data), [rna_values(c) for c in item.constraints]]
         data.append([item.parent_type, item.parent_bone, list(item.parent_vertices),
                      [list(row) for row in item.matrix_parent_inverse]])
